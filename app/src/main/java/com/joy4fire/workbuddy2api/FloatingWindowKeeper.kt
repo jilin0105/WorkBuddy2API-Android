@@ -64,6 +64,9 @@ object FloatingWindowKeeper {
     /** 收起时的缩放比例。保持接近原始大小——缩太小就变成"消失在边缘"，反而不像"躲"。 */
     private const val COLLAPSED_SCALE = 1f
 
+    /** 常态位置距屏幕边缘的留白（dp）。收起时不留白，展开/拖动后留出来，视觉上不黏边。 */
+    private const val REST_MARGIN_DP = 8
+
     /** 静止多久后自动收拢（毫秒）。 */
     private const val AUTO_COLLAPSE_DELAY = 3000L
 
@@ -284,20 +287,25 @@ object FloatingWindowKeeper {
             val screenW = screenWidth()
             val centerX = lp.x + ballSizePx / 2f
             val toRight = screenW - centerX >= centerX
-            // 关键：窗口本身不推出屏幕，只把绘制内容偏移出去。
-            // 如果把窗口整体移出屏幕，露出的那一小块就是全部触摸区域，用户几乎点不中；
-            // 保持窗口完整留在屏内、用 drawOffsetX 控制可见量，触摸热区就是整颗球。
-            //
-            // 露出一半（COLLAPSED_VISIBLE_RATIO）：视觉上明确是"躲在边缘探头"，
-            // 而不是缩成一条看不清的弧——那样用户会以为球丢了，反而要费劲找。
+            // 分两步才能得到"躲在屏幕边缘"的效果：
+            //   1) 窗口先真正贴到屏幕最边缘（不留边距）——否则球停在距边 6dp 处，
+            //      再怎么偏移也只是刚碰到边缘，看起来像"没躲"甚至"往屏幕里挪"。
+            //   2) 再把绘制内容向屏幕外偏移，让球有一半被屏幕边缘裁掉。
+            // 窗口本身始终完整留在屏内，触摸热区不受影响。
             val visible = (ballSizePx * COLLAPSED_VISIBLE_RATIO).toInt()
+            val targetX = if (toRight) screenW - ballSizePx else 0
             val targetOffset = if (toRight)
                 (ballSizePx - visible).toFloat()
             else
                 -(ballSizePx - visible).toFloat()
             collapsed = true
             collapsedRight = toRight
-            animateTo(toScale = COLLAPSED_SCALE, toAlpha = COLLAPSED_ALPHA, toOffsetX = targetOffset)
+            animateTo(
+                toX = targetX,
+                toScale = COLLAPSED_SCALE,
+                toAlpha = COLLAPSED_ALPHA,
+                toOffsetX = targetOffset
+            )
         }
 
         private fun expand() {
@@ -306,8 +314,17 @@ object FloatingWindowKeeper {
                 return
             }
             collapsed = false
-            animateTo(toScale = 1f, toAlpha = 1f, toOffsetX = 0f)
+            // 从紧贴边缘的位置弹回"留一点边距"的常态位置，否则展开后球会黏在屏幕边上。
+            val targetX = if (collapsedRight) {
+                screenWidth() - ballSizePx - restMarginPx()
+            } else {
+                restMarginPx()
+            }
+            animateTo(toX = targetX, toScale = 1f, toAlpha = 1f, toOffsetX = 0f)
         }
+
+        /** 常态位置距屏幕边缘的留白。 */
+        private fun restMarginPx(): Int = (REST_MARGIN_DP * density).toInt()
 
         /**
          * 统一动画入口：一次驱动「位置 + 缩放 + 透明度 + 绘制偏移」四个量。
@@ -479,8 +496,8 @@ object FloatingWindowKeeper {
             val screenW = screenWidth()
             val centerX = lp.x + ballSizePx / 2f
             val toRight = screenW - centerX >= centerX
-            val restMargin = (6 * density).toInt()
-            val targetX = if (toRight) screenW - ballSizePx - restMargin else restMargin
+            val margin = restMarginPx()
+            val targetX = if (toRight) screenW - ballSizePx - margin else margin
             animateTo(toX = targetX, toScale = 1f, toAlpha = 1f, toOffsetX = 0f)
             // 贴边后重新计时，用户不再碰它就会缩起来。
             handler.removeCallbacks(collapseTask)
