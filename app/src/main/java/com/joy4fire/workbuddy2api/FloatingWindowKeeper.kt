@@ -40,9 +40,10 @@ import kotlin.math.min
  *
  * - **球形外观**：自绘圆形，比矩形小窗更轻、不遮挡内容
  * - **全屏拖动**：手指按住可拖到屏幕任意位置，边界内自动夹紧
- * - **自动收拢**：3 秒无操作后贴边并缩为半透明小球（只留一条弧），点一下即恢复
+ * - **自动半藏**：3 秒无操作后贴到最近一侧，只露半个球在边缘
  *
- * 收起状态刻意保留一小段可见弧，否则用户会以为"球丢了"而反复找；
+ * 收起时刻意保留**一半**可见：露出太少会让人以为"球丢了"而去反复找，
+ * 露一半则一眼能看出是"躲在边上"，既不碍事也随点随到。
  * 同时它不能被完全隐藏——窗口不可见就等于失去 VISIBLE 优先级，保活收益直接归零。
  */
 object FloatingWindowKeeper {
@@ -54,11 +55,14 @@ object FloatingWindowKeeper {
     /** 球体直径（dp）。48dp 是 Android 最小可点击尺寸，小于它会很难拖准。 */
     private const val BALL_DP = 52
 
-    /** 收起后的可见宽度（dp）。留一条弧，避免用户以为球丢了。 */
-    private const val COLLAPSED_VISIBLE_DP = 14
+    /** 收起后露在屏幕内的宽度占比（0.5 = 只露半个球）。 */
+    private const val COLLAPSED_VISIBLE_RATIO = 0.5f
 
-    /** 收起时的缩放比例。位置计算需要按它折算实际渲染直径，否则露出的宽度会偏大。 */
-    private const val COLLAPSED_SCALE = 0.9f
+    /** 收起时的透明度。留一点通透感，让用户知道它是可交互的，但不要降到看不清。 */
+    private const val COLLAPSED_ALPHA = 0.88f
+
+    /** 收起时的缩放比例。保持接近原始大小——缩太小就变成"消失在边缘"，反而不像"躲"。 */
+    private const val COLLAPSED_SCALE = 1f
 
     /** 静止多久后自动收拢（毫秒）。 */
     private const val AUTO_COLLAPSE_DELAY = 3000L
@@ -190,7 +194,6 @@ object FloatingWindowKeeper {
 
         private val density = resources.displayMetrics.density
         val ballSizePx = (BALL_DP * density).toInt()
-        private val collapsedVisiblePx = (COLLAPSED_VISIBLE_DP * density).toInt()
 
         private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -282,16 +285,19 @@ object FloatingWindowKeeper {
             val centerX = lp.x + ballSizePx / 2f
             val toRight = screenW - centerX >= centerX
             // 关键：窗口本身不推出屏幕，只把绘制内容偏移出去。
-            // 如果把窗口整体移出屏幕，露出的那 14dp 就是全部触摸区域，用户几乎点不中；
-            // 保持窗口完整留在屏内、用 drawOffsetX 控制可见量，触摸热区就是整颗球（52dp）。
-            // 用局部变量算目标值，交给 animateTo 去插值——直接写字段会让动画起点=终点，没有过渡。
+            // 如果把窗口整体移出屏幕，露出的那一小块就是全部触摸区域，用户几乎点不中；
+            // 保持窗口完整留在屏内、用 drawOffsetX 控制可见量，触摸热区就是整颗球。
+            //
+            // 露出一半（COLLAPSED_VISIBLE_RATIO）：视觉上明确是"躲在边缘探头"，
+            // 而不是缩成一条看不清的弧——那样用户会以为球丢了，反而要费劲找。
+            val visible = (ballSizePx * COLLAPSED_VISIBLE_RATIO).toInt()
             val targetOffset = if (toRight)
-                (ballSizePx - collapsedVisiblePx).toFloat()
+                (ballSizePx - visible).toFloat()
             else
-                -(ballSizePx - collapsedVisiblePx).toFloat()
+                -(ballSizePx - visible).toFloat()
             collapsed = true
             collapsedRight = toRight
-            animateTo(toScale = COLLAPSED_SCALE, toAlpha = 0.55f, toOffsetX = targetOffset)
+            animateTo(toScale = COLLAPSED_SCALE, toAlpha = COLLAPSED_ALPHA, toOffsetX = targetOffset)
         }
 
         private fun expand() {
@@ -381,27 +387,24 @@ object FloatingWindowKeeper {
             ringPaint.alpha = (150 * alpha).toInt().coerceIn(0, 255)
             canvas.drawCircle(cx, cy, radius - 1f, ringPaint)
 
-            // 收起时不画内部图形——此时只露一小条弧，画了也看不全，反而显得脏。
-            if (!collapsed) {
-                // 图形：一个"链接/节点"符号，暗示这是网络服务而非普通 App。
-                // 注意每个 Paint 用前都要显式设 alpha：Paint 对象是复用的，
-                // 上一次绘制留下的 alpha 会带到下一次（曾导致状态点越画越透明）。
-                val r = radius * 0.42f
-                iconPaint.alpha = opaque
-                canvas.drawArc(RectF(cx - r, cy - r, cx + r, cy + r), -50f, 100f, false, iconPaint)
-                canvas.drawArc(RectF(cx - r, cy - r, cx + r, cy + r), 130f, 100f, false, iconPaint)
+            // 图形：一个"链接/节点"符号，暗示这是网络服务而非普通 App。
+            // 注意每个 Paint 用前都要显式设 alpha：Paint 对象是复用的，
+            // 上一次绘制留下的 alpha 会带到下一次（曾导致状态点越画越透明）。
+            val r = radius * 0.42f
+            iconPaint.alpha = opaque
+            canvas.drawArc(RectF(cx - r, cy - r, cx + r, cy + r), -50f, 100f, false, iconPaint)
+            canvas.drawArc(RectF(cx - r, cy - r, cx + r, cy + r), 130f, 100f, false, iconPaint)
 
-                // 状态点：右下角小圆，绿=运行中、红=已停止。比文字更省空间。
-                val dotR = radius * 0.16f
-                // 收起时球贴在屏幕边缘，状态点要画在"朝屏幕内侧"的一边，否则会被边缘裁掉看不见。
-                val side = if (!collapsed || collapsedRight) 1f else -1f
-                val dotX = cx + radius * 0.66f * side
-                val dotY = cy + radius * 0.66f
-                statusDotPaint.alpha = (230 * alpha).toInt().coerceIn(0, 255)
-                canvas.drawCircle(dotX, dotY, dotR + 1.8f * density, statusDotPaint)
-                statusDotPaint.alpha = opaque
-                canvas.drawCircle(dotX, dotY, dotR, statusDotPaint)
-            }
+            // 状态点：右下角小圆，绿=运行中、红=已停止。比文字更省空间。
+            val dotR = radius * 0.16f
+            // 收起时球半藏在屏幕边缘，状态点要画在"朝屏幕内侧"的一边，否则会被边缘裁掉看不见。
+            val side = if (collapsed && collapsedRight) -1f else 1f
+            val dotX = cx + radius * 0.62f * side
+            val dotY = cy + radius * 0.62f
+            statusDotPaint.alpha = (230 * alpha).toInt().coerceIn(0, 255)
+            canvas.drawCircle(dotX, dotY, dotR + 1.8f * density, statusDotPaint)
+            statusDotPaint.alpha = opaque
+            canvas.drawCircle(dotX, dotY, dotR, statusDotPaint)
 
             canvas.restore()
         }
