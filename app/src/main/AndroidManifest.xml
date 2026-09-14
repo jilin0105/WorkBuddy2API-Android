@@ -16,6 +16,10 @@
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <!-- 开机自启：系统重启后把服务拉回来，否则每次重启手机本地 API 都会失联。 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 悬浮窗（可选保活）：可见窗口会让进程处于 VISIBLE 级别，LMK 回收时排在前台服务之后。
+         注意它只能"降低被杀概率"，挡不住厂商的一键清理/速冻，详见设置页说明。
+         需 SYSTEM_ALERT_WINDOW 运行时授权。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
         android:allowBackup="false"

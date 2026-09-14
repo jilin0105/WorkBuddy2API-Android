@@ -59,6 +59,9 @@ class ApiHostService : Service() {
         scheduleWatchdog()
         workers.execute { serve() }
         maintenance.scheduleWithFixedDelay({ runMaintenanceTick() }, 5, 60, TimeUnit.SECONDS)
+        // 悬浮窗：可选加固项，提升进程到 VISIBLE 档，降低内存吃紧时被 LMK 回收的概率。
+        // 未授权/未开启时内部自行跳过，不会影响服务本体。
+        FloatingWindowKeeper.show(this, PORT)
     }
 
     /**
@@ -774,6 +777,7 @@ class ApiHostService : Service() {
 
     override fun onDestroy() {
         running = false
+        runCatching { FloatingWindowKeeper.hide(this) }
         runCatching { server?.close() }
         releaseWakeLock()
         workers.shutdownNow()

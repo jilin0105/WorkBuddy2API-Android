@@ -199,6 +199,23 @@ class MainActivity : Activity() {
         super.onStop()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // 从系统「显示在其他应用上层」授权页返回时不会有任何回调，只能在这里自查：
+        // 用户可能刚授权完，此时把窗口补上，否则会出现"开关是开的、窗口却没有"的困惑。
+        runCatching {
+            if (FloatingWindowKeeper.isEnabled(this) && FloatingWindowKeeper.hasPermission(this)) {
+                // 只在服务确实活着时补窗口，避免产生"孤儿窗口"：
+                // 若服务已被系统杀掉（running=false），窗口应由服务重启后自己创建，
+                // 否则服务一直起不来时，窗口会带着"运行中"的假象永久留在屏幕上。
+                if (ApiHostService.running && !FloatingWindowKeeper.isShowing()) {
+                    FloatingWindowKeeper.show(this, ApiHostService.PORT)
+                }
+                floatingStateText?.text = floatingSummary()
+            }
+        }
+    }
+
     override fun onDestroy() {
         oauthSession = null
         io.shutdownNow()
@@ -991,6 +1008,47 @@ class MainActivity : Activity() {
                 "本版已加入开机自启、划掉任务后自动重启、15 分钟看门狗兜底，" +
                 "即使中途被杀也会自动拉回；配合下面的设置可显著降低被杀的频率。"), top(6))
         })
+        // 悬浮窗：可选加固项。这里必须把能力边界写清楚，否则用户会误以为它是保活银弹。
+        addView(card(topMargin = 12) {
+            addView(text("悬浮窗保活（可选）", 16, true))
+            addView(caption("开启后会在屏幕上常驻一个小窗，显示服务运行状态。"), top(6))
+            addView(caption("作用：可见窗口会把这个进程提升到 VISIBLE 优先级，在内存不足被回收的场景下，" +
+                "排在后台服务之后，能降低被清理的概率；部分系统判定「速冻」时也会参考是否有可见窗口。"), top(6))
+            addView(caption("局限性（务必知悉）：它挡不住系统的「一键清理」「强力清理」——那类操作走白名单机制，" +
+                "不在白名单里窗口再多也照杀。所以它只是辅助手段，真正的主力仍是上面的白名单设置 + 自动重启兜底。"), top(6))
+            val floatingSwitch = Switch(this@MainActivity).apply {
+                text = "启用悬浮窗保活"
+                textSize = 15f
+                setTextColor(color(R.color.wb_on_surface))
+                minHeight = dp(48)
+                isChecked = FloatingWindowKeeper.isEnabled(this@MainActivity)
+                setOnCheckedChangeListener { _, checked ->
+                    if (checked && !FloatingWindowKeeper.hasPermission(this@MainActivity)) {
+                        // 没授权就先引导去授权；开关状态照常记录，授权返回后由自检自动补上窗口。
+                        FloatingWindowKeeper.setEnabled(this@MainActivity, true)
+                        toast("需授予「显示在其他应用上层」权限")
+                        FloatingWindowKeeper.requestPermission(this@MainActivity)
+                    } else {
+                        FloatingWindowKeeper.setEnabled(this@MainActivity, checked)
+                        if (checked) {
+                            FloatingWindowKeeper.show(this@MainActivity, ApiHostService.PORT)
+                            toast("悬浮窗已启用")
+                        } else {
+                            FloatingWindowKeeper.hide(this@MainActivity)
+                            toast("悬浮窗已关闭")
+                        }
+                    }
+                    floatingStateText?.text = floatingSummary()
+                }
+            }
+            addView(floatingSwitch, top(10))
+            floatingStateText = caption("").also { addView(it, top(6)) }
+            floatingStateText?.text = floatingSummary()
+            addView(action("检查/申请悬浮窗权限", outlined = true, full = true) {
+                if (FloatingWindowKeeper.hasPermission(this@MainActivity)) toast("权限已授予")
+                else FloatingWindowKeeper.requestPermission(this@MainActivity)
+            }, top(8))
+        })
         addView(card(topMargin = 12) {
             addView(text("请依次完成以下设置", 16, true))
             addView(caption("点击每一项可直接跳到对应设置页；跳转失败会打开应用详情页，请按提示文字手动查找。"), top(6))
@@ -1170,6 +1228,8 @@ class MainActivity : Activity() {
     /** 检查当前能自动判定的保活项，给出还差什么的明确结论。 */
     /** 存储占用摘要文本：界面顶部常驻显示，让用户随时知道数据长到多大了。 */
     private var storageUsageText: android.widget.TextView? = null
+    /** 悬浮窗状态说明（随开关与权限变化刷新）。 */
+    private var floatingStateText: android.widget.TextView? = null
 
     private fun storageRetentionDays(): Int =
         NativeCore.settings(this).optString("usage_retention_days", "30").toIntOrNull()?.coerceIn(1, 3650) ?: 30
@@ -1179,6 +1239,19 @@ class MainActivity : Activity() {
         bytes >= 1024L * 1024 -> String.format(Locale.US, "%.1f MB", bytes / 1024.0 / 1024)
         bytes >= 1024L -> String.format(Locale.US, "%.0f KB", bytes / 1024.0)
         else -> "$bytes B"
+    }
+
+    /** 悬浮窗当前状态：把「开关是否打开」与「权限是否授予」分开说，否则用户会困惑于"开了却没效果"。 */
+    private fun floatingSummary(): String {
+        val enabled = FloatingWindowKeeper.isEnabled(this)
+        val permitted = FloatingWindowKeeper.hasPermission(this)
+        return when {
+            !enabled -> "未启用。启用后需授予「显示在其他应用上层」权限。"
+            !permitted -> "已开启但缺少悬浮窗权限，请点下方按钮授权；授权后返回本页即生效。"
+            !ApiHostService.running -> "已开启且权限就绪；服务启动后会显示悬浮窗。"
+            FloatingWindowKeeper.isShowing() -> "运行中：悬浮窗已显示，进程处于可见状态。"
+            else -> "服务运行中，悬浮窗尚未显示（可返回桌面后重新进入本页）。"
+        }
     }
 
     private fun storageSummary(): String = runCatching {
