@@ -1008,23 +1008,25 @@ class MainActivity : Activity() {
                 "本版已加入开机自启、划掉任务后自动重启、15 分钟看门狗兜底，" +
                 "即使中途被杀也会自动拉回；配合下面的设置可显著降低被杀的频率。"), top(6))
         })
-        // 悬浮窗：可选加固项。这里必须把能力边界写清楚，否则用户会误以为它是保活银弹。
+        // 悬浮球：可选加固项。这里必须把能力边界写清楚，否则用户会误以为它是保活银弹。
         addView(card(topMargin = 12) {
-            addView(text("悬浮窗保活（可选）", 16, true))
-            addView(caption("开启后会在屏幕上常驻一个小窗，显示服务运行状态。"), top(6))
+            addView(text("悬浮球保活（可选）", 16, true))
+            addView(caption("开启后屏幕上会出现一个圆形悬浮球，显示服务运行状态（绿点=运行中，红点=已停止）。"), top(6))
+            addView(caption("操作方式：按住可拖到屏幕任意位置；松手后自动吸附到最近的屏幕边缘；" +
+                "3 秒不碰它会缩成一道细弧躲到边上，点一下即可重新展开。"), top(6))
             addView(caption("作用：可见窗口会把这个进程提升到 VISIBLE 优先级，在内存不足被回收的场景下，" +
                 "排在后台服务之后，能降低被清理的概率；部分系统判定「速冻」时也会参考是否有可见窗口。"), top(6))
             addView(caption("局限性（务必知悉）：它挡不住系统的「一键清理」「强力清理」——那类操作走白名单机制，" +
                 "不在白名单里窗口再多也照杀。所以它只是辅助手段，真正的主力仍是上面的白名单设置 + 自动重启兜底。"), top(6))
             val floatingSwitch = Switch(this@MainActivity).apply {
-                text = "启用悬浮窗保活"
+                text = "启用悬浮球保活"
                 textSize = 15f
                 setTextColor(color(R.color.wb_on_surface))
                 minHeight = dp(48)
                 isChecked = FloatingWindowKeeper.isEnabled(this@MainActivity)
                 setOnCheckedChangeListener { _, checked ->
                     if (checked && !FloatingWindowKeeper.hasPermission(this@MainActivity)) {
-                        // 没授权就先引导去授权；开关状态照常记录，授权返回后由自检自动补上窗口。
+                        // 没授权就先引导去授权；开关状态照常记录，授权返回后由 onResume 自动补上球。
                         FloatingWindowKeeper.setEnabled(this@MainActivity, true)
                         toast("需授予「显示在其他应用上层」权限")
                         FloatingWindowKeeper.requestPermission(this@MainActivity)
@@ -1032,10 +1034,10 @@ class MainActivity : Activity() {
                         FloatingWindowKeeper.setEnabled(this@MainActivity, checked)
                         if (checked) {
                             FloatingWindowKeeper.show(this@MainActivity, ApiHostService.PORT)
-                            toast("悬浮窗已启用")
+                            toast("悬浮球已开启")
                         } else {
                             FloatingWindowKeeper.hide(this@MainActivity)
-                            toast("悬浮窗已关闭")
+                            toast("悬浮球已关闭")
                         }
                     }
                     floatingStateText?.text = floatingSummary()
@@ -1248,9 +1250,9 @@ class MainActivity : Activity() {
         return when {
             !enabled -> "未启用。启用后需授予「显示在其他应用上层」权限。"
             !permitted -> "已开启但缺少悬浮窗权限，请点下方按钮授权；授权后返回本页即生效。"
-            !ApiHostService.running -> "已开启且权限就绪；服务启动后会显示悬浮窗。"
-            FloatingWindowKeeper.isShowing() -> "运行中：悬浮窗已显示，进程处于可见状态。"
-            else -> "服务运行中，悬浮窗尚未显示（可返回桌面后重新进入本页）。"
+            !ApiHostService.running -> "已开启且权限就绪；服务启动后会显示悬浮球。"
+            FloatingWindowKeeper.isShowing() -> "运行中：悬浮球已显示，进程处于可见状态。"
+            else -> "服务运行中，悬浮球尚未显示（可返回桌面后重新进入本页）。"
         }
     }
 
