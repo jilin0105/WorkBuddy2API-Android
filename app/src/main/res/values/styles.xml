@@ -13,6 +13,21 @@
         <item name="android:windowActionModeOverlay">true</item>
     </style>
 
+    <!-- Miuix（Compose）界面专用主题。
+         为什么必须单独一个：Compose 的 ComponentActivity 需要 AppCompat/Material 系
+         主题才能正确初始化窗口与主题属性；而上面那个纯 android:Theme.Material.Light
+         不是 AppCompat 系，Compose 的 MaterialTheme 取色与 edge-to-edge 会走到兜底分支。
+         这里继承 AppCompat 的无 ActionBar 主题并关掉系统栏对比度强制，
+         让 Miuix 自己负责绘制背景。 -->
+    <style name="Theme.Workbuddy2API.Miuix" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/wb_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+
     <style name="WbText" />
 
     <style name="WbText.Title">

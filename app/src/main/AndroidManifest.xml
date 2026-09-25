@@ -29,16 +29,21 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Workbuddy2API"
         android:usesCleartextTraffic="false">
+        <!-- 启动入口改为 Miuix 界面（含移植来的成长中心与提示词注入）。 -->
         <activity
-            android:name=".MainActivity"
+            android:name=".MiuixHostActivity"
             android:exported="true"
             android:screenOrientation="unspecified"
+            android:theme="@style/Theme.Workbuddy2API.Miuix"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- 原纯 View 界面已停用：其全部页面（概览/账号/模型/记录/应用/设置/用量/取证/存储/保活）
+             均已迁入 MiuixHostActivity 的 Compose 界面，故这里不再注册。
+             MainActivity.kt 源码保留在代码库中，作为迁移前的参考实现，不参与打包。 -->
         <activity
             android:name=".OAuthWebActivity"
             android:exported="false"

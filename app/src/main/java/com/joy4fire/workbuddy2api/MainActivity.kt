@@ -612,11 +612,11 @@ class MainActivity : Activity() {
         addView(section("接入配置"))
         addView(card {
             addView(labelValue("Base URL", "http://127.0.0.1:${ApiHostService.PORT}/v1"))
-            addView(labelValue("认证请求头", "Authorization=[REDACTED] <API_KEY>"), top(12))
+            addView(labelValue("认证请求头", "Authorization: Bearer <API_KEY>"), top(12))
             addView(labelValue("兼容请求头", "X-Api-Key: <API_KEY>"), top(12))
             addView(row(top = 14) {
                 addView(action("复制地址", outlined = true) { copyText("http://127.0.0.1:${ApiHostService.PORT}/v1", "Base URL") }, weighted())
-                addView(action("复制认证格式", outlined = true) { copyText("Authorization=[REDACTED] <API_KEY>", "认证格式") }, weighted(start = 8))
+                addView(action("复制认证格式", outlined = true) { copyText("Authorization: Bearer <API_KEY>", "认证格式") }, weighted(start = 8))
             })
         })
         addView(section("应用凭据"))
@@ -978,6 +978,38 @@ class MainActivity : Activity() {
                 storageUsageText?.text = storageSummary()
             }, top(8))
         })
+        addView(section("出网取证 · 与官方 CLI 比对"))
+        addView(tonalCard {
+            addView(text("这是什么？", 15, true))
+            addView(caption("记录「实际发给上游的最后一份 headers/body」，用于与官方 CLI 的抓包逐字节比对，确认反代在身份上是否与官方一致。"), top(6))
+            addView(caption("记录的是发送前一刻的数据，中间不再有任何改写；导出文本保持原始紧凑 JSON 格式（不做缩进美化），可直接贴进 diff 工具。"), top(6))
+            addView(caption("敏感头（Authorization / X-Api-Key / Cookie）会保形脱敏——保留头名、前后缀与总长度，但隐藏凭据本体，因此不影响「这个头有没有发、格式对不对」的判断。"), top(6))
+        })
+        addView(card {
+            // 注意：card{} 的 lambda 接收者是 LinearLayout，所以这里必须写
+            // this@MainActivity 才能把 Activity 当 Context 传进去。
+            val ctx = this@MainActivity
+            val enabled = RequestInspector.isEnabled(ctx)
+            addView(menuRow(
+                if (enabled) "●" else "○",
+                "记录出网请求",
+                if (enabled) "已开启 · 当前 ${RequestInspector.count(ctx)} 条（仅保留最近 20 条）"
+                else "已关闭 · 开启后会留存请求内容（含对话正文），用完请清空"
+            ) {
+                RequestInspector.setEnabled(ctx, !enabled)
+                render(Page.SETTINGS)
+            })
+            addView(divider())
+            addView(menuRow("≡", "查看并复制记录", "${RequestInspector.count(ctx)} 条可导出") {
+                showRequestInspector()
+            })
+            addView(divider())
+            addView(menuRow("⌫", "清空记录", "删除已留存的全部取证数据") {
+                RequestInspector.clear(ctx)
+                toast("已清空取证记录")
+                render(Page.SETTINGS)
+            })
+        })
         addView(section("系统"))
         addView(card {
             addView(menuRow("↗", "电池优化白名单", "防后台冻结，其他软件随时可连") {
@@ -1275,6 +1307,85 @@ class MainActivity : Activity() {
     }
 
     /** 存储占用详情：把体积拆开，才能看出到底是输入、输出还是思考链在占空间。 */
+    /**
+     * 出网取证页 —— 查看并一键复制「实际发给上游的 headers/body」。
+     *
+     * 用途：与官方 CLI 逐字节比对。界面上同时提供「复制全部」，因为导出的文本
+     * 本来就是要贴到别处做 diff 的，逐条复制没有意义。
+     */
+    private fun showRequestInspector() {
+        val arr = RequestInspector.entries(this)
+        if (arr.length() == 0) {
+            AlertDialog.Builder(this)
+                .setTitle("出网取证")
+                .setMessage("暂无记录。\n\n请先在上方开启「记录出网请求」，然后发起一次对话——"
+                    + "记录的是真正发给上游的最后一帧头与体，可直接与官方 CLI 抓包逐字节比对。")
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+
+        val fmt = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
+        val items = Array(arr.length()) { i ->
+            val e = arr.optJSONObject(i)
+            val t = fmt.format(java.util.Date(e?.optLong("ts") ?: 0L))
+            val n = e?.optJSONObject("headers")?.length() ?: 0
+            "$t  ·  $n 个头  ·  账号 ${e?.optString("account").orEmpty().take(6)}"
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("出网取证（${arr.length()} 条）")
+            .setItems(items) { _, which -> showInspectorDetail(which) }
+            .setPositiveButton("复制全部") { _, _ ->
+                // 一键复制：导出文本即为可直接 diff 的形态，无需再加工。
+                copyText(RequestInspector.exportText(this), "出网取证记录")
+            }
+            .setNegativeButton("关闭", null)
+            .setNeutralButton("清空") { _, _ ->
+                RequestInspector.clear(this)
+                toast("已清空取证记录")
+            }
+            .show()
+    }
+
+    /** 单条明细：头列表 + 原始 body，同时提供该条的复制。 */
+    private fun showInspectorDetail(index: Int) {
+        val arr = RequestInspector.entries(this)
+        val e = arr.optJSONObject(index) ?: return
+
+        val sb = StringBuilder()
+        sb.append(e.optString("method")).append(' ').append(e.optString("url")).append("\n\n")
+        val hs = e.optJSONObject("headers")
+        if (hs != null) {
+            val it = hs.keys()
+            while (it.hasNext()) {
+                val k = it.next()
+                sb.append(k).append(": ").append(hs.optString(k)).append('\n')
+            }
+        }
+        sb.append('\n').append(e.optString("body"))
+
+        val scroll = android.widget.ScrollView(this).apply {
+            setPadding(dp(20), dp(12), dp(20), dp(12))
+            addView(TextView(this@MainActivity).apply {
+                text = sb.toString()
+                textSize = 12f
+                // 等宽字体：字段顺序比对靠肉眼扫，「对齐」能显著降低误读概率。
+                typeface = android.graphics.Typeface.MONOSPACE
+                setTextIsSelectable(true)
+                setTextColor(color(R.color.wb_on_surface))
+            })
+        }
+        AlertDialog.Builder(this)
+            .setTitle("第 ${index + 1} 条")
+            .setView(scroll)
+            .setPositiveButton("复制此条") { _, _ ->
+                copyText(sb.toString(), "该条取证记录")
+            }
+            .setNegativeButton("返回", null)
+            .show()
+    }
+
     private fun showStorageInfo() {
         val sb = StringBuilder()
         runCatching {
@@ -1613,7 +1724,7 @@ class MainActivity : Activity() {
         copyText(key, "API Key")
         AlertDialog.Builder(this)
             .setTitle("本地 API Key")
-            .setMessage("$key\n\n已复制。可放入 Authorization=[REDACTED] 请求头或 X-Api-Key。")
+            .setMessage("$key\n\n已复制。可放入 Authorization: Bearer 请求头或 X-Api-Key。")
             .setPositiveButton("知道了", null)
             .show()
     }
@@ -1874,11 +1985,17 @@ class MainActivity : Activity() {
         /** 优先级可调范围：0 = 不额外加权（权重 1.0）；20 已是权重 ×21，足够拉开账号间差距又不至于让滑块粒度失控。 */
         private const val PRIORITY_MIN = 0
         private const val PRIORITY_MAX = 20
-        private var oauthHostRef: WeakReference<MainActivity>? = null
-
-        /** 内置登录窗口关闭时回调：用户主动退出就不必再等这轮授权，避免几分钟后莫名弹出"登录等待超时"。 */
+        /**
+         * 内置登录窗口关闭时回调：用户主动退出就不必再等这轮授权，
+         * 避免几分钟后莫名弹出「登录等待超时」。
+         *
+         * 该界面已由 MiuixHostActivity 取代，此处仅保留以维持源码可编译参考；
+         * 回调注册走 OAuthWebActivity.onClosed（见该字段注释）。
+         */
         fun notifyOAuthWindowClosed() {
             oauthHostRef?.get()?.onOAuthWindowClosed()
         }
+
+        private var oauthHostRef: WeakReference<MainActivity>? = null
     }
 }

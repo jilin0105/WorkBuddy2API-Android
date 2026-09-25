@@ -43,10 +43,9 @@ class OAuthWebActivity : Activity() {
         private const val TAG = "OAuthWeb"
 
         /** 登录页会做浏览器探测：默认 WebView UA 带 "; wv" 标记，容易被降级渲染或直接拒绝；
-         *  伪装成同版本移动 Chrome，仍然由内置 WebView 承载，不会跳出应用。 */
-        private const val MOBILE_UA =
-            "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/125.0.0.0 Mobile Safari/537.36"
+         *  伪装成同版本移动 Chrome，仍然由内置 WebView 承载，不会跳出应用。
+         *  取值统一由 ClientIdentity 提供，避免各文件各写一份 UA 导致身份漂移。 */
+        private val MOBILE_UA = ClientIdentity.MOBILE_BROWSER_UA
 
         /** 登录流程内可留在内置 WebView 的协议；其余（weixin://、mqq:// 等）才交给系统。 */
         private val IN_APP_SCHEMES = setOf("http", "https", "about", "blob", "data", "javascript")
@@ -71,6 +70,15 @@ class OAuthWebActivity : Activity() {
         """
 
         private var current: WeakReference<OAuthWebActivity>? = null
+
+        /**
+         * 宿主注册的「登录窗口已关闭」回调。
+         *
+         * 用可变函数引用而不是 WeakReference<Activity>：宿主可以是任意 Activity 实现，
+         * 登录窗口不该知道宿主是谁（否则移除旧界面时会牵连编译）。
+         * 宿主在发起登录时注册、在 onDestroy 里置空即可避免泄漏。
+         */
+        var onClosed: (() -> Unit)? = null
 
         /** 轮询到授权成功后由 MainActivity 调用，自动关闭内置登录窗口。 */
         fun dismissIfOpen() {
@@ -342,8 +350,10 @@ class OAuthWebActivity : Activity() {
 
     override fun onDestroy() {
         if (current?.get() === this) current = null
-        // 通知主界面结束本轮授权等待（成功自动关窗时已被 main 侧清空，不会误取消）
-        MainActivity.notifyOAuthWindowClosed()
+        // 通知宿主结束本轮授权等待（成功自动关窗时宿主已自行清空，不会误取消）。
+        // 走通用回调而不是直接调 MainActivity：登录窗口是通用组件，
+        // 宿主可能是 Miuix 界面也可能仍是旧界面，硬编码任一方都会在另一方被移除后编译失败。
+        onClosed?.invoke()
         webView?.let { web ->
             // 关窗前清掉本次授权产生的磁盘缓存：登录页资源（JS/图片/字体）体量可观，
             // 且下一次登录还会再拉一遍，留着只会白占空间。clearCache(true) 清磁盘部分。

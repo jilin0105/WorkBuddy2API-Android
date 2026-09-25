@@ -304,6 +304,11 @@ class ApiHostService : Service() {
     }
 
     private fun proxy(output: OutputStream, socket: Socket, chatBody: JSONObject, protocol: Protocol, stream: Boolean, app: JSONObject) {
+        // 提示词注入 + 第三方客户端指纹清洗（移植自 1.2.7 的 a.I2 / a.C0045h2.Y）。
+        // 必须放在 proxy 最前面：所有协议适配器（anthropic/responses → chat）出来的
+        // 都是同一份 requestBody，只在这里处理一次就不会漏，也不会重复注入。
+        runCatching { PromptInjection.apply(chatBody, NativeCore.settings(this)) }
+            .onFailure { Log.w(TAG, "prompt pipeline failed; sending original body", it) }
         val model = chatBody.optString("model", "auto")
         val startedAt = System.currentTimeMillis()
         val inputSummary = inputText(chatBody)
@@ -322,18 +327,53 @@ class ApiHostService : Service() {
         try {
             // 选号与 token 刷新同样可能失败（无可用账号 / 凭证过期），必须放进 try 内，
             // 否则异常会直接冒泡成 503，使用记录里完全看不到这次调用。
-            val upstream = NativeCore.upstreamRequest(this, chatBody, region)
-            account = upstream.account
-            call = NativeCore.http.newCall(upstream.request)
-            response = call.execute()
-            if (!response.isSuccessful) {
+            //
+            // 换号重试（对齐上游 app.py:279-303）：仅对 429/502/503 换一次健康账号，
+            // 不递归。顺序严格遵守上游设计——
+            //   ① 先冷却刚失败的账号（否则 healthy_count 会把它又算进来）
+            //   ② 再数健康账号，<1 则放弃
+            //   ③ 换号后必须把 account 指向**实际使用的账号**，usage 记账才归因正确
+            // CODE_REVIEW_TODO.md:190-193 明确记录过这个顺序的由来（早期版本只重试不冷却，
+            // 结果重试又选中同一个号，等于没重试）。
+            var attempt = 0
+            while (true) {
+                val upstream = NativeCore.upstreamRequest(this, chatBody, region)
+                account = upstream.account
+                call = NativeCore.http.newCall(upstream.request)
+                response = call.execute()
+                if (response.isSuccessful) break
+
                 val raw = response.body?.string().orEmpty()
-                val errorBody = safeUpstreamError(raw, response.code)
-                logUsage(protocol, model, startedAt, "error", "HTTP ${response.code}", null, inputSummary, "", "", app, account)
-                json(output, response.code, errorBody)
+                val code = response.code
+                // 失败必须落痕：此前这里直接 return，429 打完一个标记都不留，
+                // 下一个请求照样选中同一个已被限流的账号，形成限流风暴。
+                NativeCore.store(this).markAccountFailure(account.key, NativeCore.cooldownFor(code))
+                if (code in RETRYABLE_STATUS && attempt == 0 && !socket.isClosed) {
+                    attempt++
+                    response.close()
+                    val healthy = NativeCore.store(this).countHealthy(region.id)
+                    Log.w(TAG, "upstream $code on ${account.uid}; retrying with another account (healthy=$healthy)")
+                    if (healthy < 1) {
+                        logUsage(protocol, model, startedAt, "error", "HTTP $code", null, inputSummary, "", "", app, account)
+                        json(output, code, safeUpstreamError(raw, code))
+                        return
+                    }
+                    continue
+                }
+                val errorBody = safeUpstreamError(raw, code)
+                // 内容被拦 → 当天切降级提示词（移植自 1.2.7 的 useDegradedPrompt 机制）。
+                // 判定口径刻意放宽：上游对这类拦截的措辞不稳定（content blocked /
+                // 内容安全 / 11128），逐字匹配必然漏。宁可多触发一次降级（代价只是
+                // 当天用一句通用提示词），也不要漏掉导致用户整天不可用。
+                maybeDegradePrompt(this@ApiHostService, code, raw)
+                logUsage(protocol, model, startedAt, "error", "HTTP $code", null, inputSummary, "", "", app, account)
+                json(output, code, errorBody)
                 return
             }
-            val source = response.body?.source() ?: throw IOException("上游响应为空")
+            // 请求成功：清掉失败计数，让权重里的成功率因子恢复（对齐上游 mark_success）。
+            account?.let { NativeCore.store(this).markAccountSuccess(it.key) }
+            val successResponse = response ?: throw IOException("上游响应为空")
+            val source = successResponse.body?.source() ?: throw IOException("上游响应为空")
             // Prefetch the first data event before committing HTTP 200, preserving upstream error semantics.
             val first = nextData(source)
             if (stream) {
@@ -642,6 +682,7 @@ class ApiHostService : Service() {
             runAutomaticCheckin(settings)
             runAutomaticCredits(settings)
             runAutomaticModels(settings)
+            runAutomaticKeepalive(settings)
             runAutomaticUsageCleanup(settings)
             prewarmModels()
         }.onFailure { Log.w(TAG, "maintenance tick failed", it) }
@@ -755,6 +796,40 @@ class ApiHostService : Service() {
         }
     }
 
+    /**
+     * 每日 token 保活（对齐上游 scheduler.do_keepalive）。
+     *
+     * 为什么要单独做这件事：token 只在「即将过期时才刷新」的被动策略下，长时间闲置的
+     * 账号会一路滑到 refreshToken 也过期，届时只能重新登录。上游的做法是每天强制刷一次，
+     * 让 refreshToken 持续滚动续期。
+     *
+     * 失败处理同样对齐上游：记录失败次数，**连续 3 次**才禁用账号（见 NativeStore
+     * .recordRefreshFailure）。单次失败（网络抖动、上游瞬时不可达）不应该被当成账号失效。
+     */
+    private fun runAutomaticKeepalive(settings: JSONObject) {
+        val hour = settings.optInt("keepalive_hour", 4).coerceIn(0, 23)
+        val now = java.util.Calendar.getInstance()
+        if (now.get(java.util.Calendar.HOUR_OF_DAY) < hour) return
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val prefs = getSharedPreferences("maintenance", Context.MODE_PRIVATE)
+        if (prefs.getString("keepalive_done", "") == today) return
+        val accounts = NativeCore.listAccounts(this)
+        if (accounts.length() == 0) return
+        var attempted = 0
+        for (i in 0 until accounts.length()) {
+            val item = accounts.optJSONObject(i) ?: continue
+            if (!item.optBoolean("enabled", true)) continue
+            val key = item.optString("account_key")
+            if (key.isBlank()) continue
+            attempted++
+            runCatching { NativeCore.refreshToken(this, key) }
+                .onSuccess { Log.i(TAG, "keepalive refreshed token: ${item.optString("uid")}") }
+                .onFailure { Log.w(TAG, "keepalive failed for ${item.optString("uid")}", it) }
+        }
+        // 只有在确实尝试过刷新时才记今日已做，避免「一个账号都没启用」也被标记完成。
+        if (attempted > 0) prefs.edit().putString("keepalive_done", today).apply()
+    }
+
     private fun stopNow() {
         running = false
         markShouldRun(applicationContext, false)
@@ -837,6 +912,47 @@ class ApiHostService : Service() {
         private const val MAX_BODY_BYTES = 10L * 1024L * 1024L
         private const val MAX_HEADER_LINE = 16 * 1024
         private const val TAG = "ApiHostService"
+
+        /**
+         * 内容被拦后触发降级提示词（移植自 1.2.7 的 useDegradedPrompt）。
+         *
+         * 设计要点：
+         *   1) 降级只持续【到当天午夜】——1.2.7 的原语义。跨天后自动恢复自定义提示词，
+         *      否则一次误伤会让用户永久用着那句通用英文词，再也回不来。
+         *   2) 把 use_degraded_prompt 存进 settings 表而不是内存变量：
+         *      服务进程会被系统重启，存内存等于每次重启就悄悄"恢复"了。
+         */
+        private const val DEGRADE_PREF = "degraded_prompt_date"
+
+        private fun maybeDegradePrompt(ctx: Context, status: Int, raw: String) {
+            if (status !in setOf(400, 403, 422)) return
+            val text = raw.lowercase(java.util.Locale.US)
+            val blocked = BLOCK_MARKERS.any { text.contains(it) }
+            if (!blocked) return
+            val today = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                .format(java.util.Date())
+            val prefs = ctx.getSharedPreferences("native", Context.MODE_PRIVATE)
+            if (prefs.getString(DEGRADE_PREF, null) == today) return
+            prefs.edit().putString(DEGRADE_PREF, today).apply()
+            NativeCore.saveSettings(ctx, JSONObject().put("use_degraded_prompt", true))
+            Log.i(TAG, "content blocked (likely system fingerprint false positive) -> degraded prompt until midnight")
+        }
+
+        /** 上游内容拦截的常见措辞（1.2.7 只匹配一句英文，这里按实测扩充）。 */
+        private val BLOCK_MARKERS = listOf(
+            "content blocked", "content_blocked", "content filter", "content_filter",
+            "content policy", "safety", "risk control", "risk_control",
+            "内容安全", "内容不合规", "敏感", "违规", "拦截"
+        )
+
+        /**
+         * 允许换号重试的上游状态码。
+         *
+         * 对齐上游 app.py:279-303——只有这三个表示「这个账号此刻不可用/被限流」，
+         * 换号才有意义。400/401/404 等是请求本身或凭据的问题，换号重试只会让
+         * 另一个健康账号也无谓挨一次错误请求。
+         */
+        private val RETRYABLE_STATUS = setOf(429, 502, 503)
 
         /**
          * 上游积分字段候选名（按优先级）。

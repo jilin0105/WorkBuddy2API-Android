@@ -197,13 +197,41 @@ object NativeCore {
     private fun headersFor(account: Account): MutableMap<String, String> {
         val auth = account.auth; val profile = account.profile
         val enterprise = profile.optString("enterpriseId", auth.optString("enterpriseId"))
+        // UA 与产品识别头统一由 ClientIdentity 提供：此前这里硬编码
+        // "Workbuddy2API-Android/1.0"，导致同一账号上传出的身份前后不一致
+        // （拉模型是浏览器、发对话是第三方网关），是最直接的可识别特征。
         return mutableMapOf(
             "Content-Type" to "application/json", "Accept" to "application/json",
             "Authorization" to "Bearer ${auth.optString("accessToken")}", "X-User-Id" to account.uid,
             "X-Enterprise-Id" to enterprise, "X-Tenant-Id" to enterprise,
             "X-Domain" to auth.optString("domain", account.region.defaultDomain).ifBlank { account.region.defaultDomain },
-            "User-Agent" to "Workbuddy2API-Android/1.0"
-        )
+            "User-Agent" to ClientIdentity.CLI_UA
+        ).apply { putAll(ClientIdentity.pluginHeaders()) }
+    }
+
+    /**
+     * 主对话请求的完整头集合 = 基础身份头 + 会话/追踪/意图头。
+     *
+     * 为什么不把会话头直接塞进 headersFor：官方 buildConversationHeaders 是
+     * 【会话作用域】的函数，只有真正的对话请求才会调用它。token 刷新、拉模型目录、
+     * 签到这些走的是插件握手/配置链路，官方【不会】给它们挂对话会话 ID。
+     *
+     * 如果我们无脑给所有出站请求都加会话头，反而制造新的一致性破绽：
+     * 一个「刷新 token 时也带着对话会话 ID」的客户端，比不带会话头更可疑。
+     *
+     * 会话 ID 按账号分桶持久化（SessionTracker），换账号必然换会话——
+     * 两个账号共享同一个 X-Conversation-ID 是会被上游直接关联的硬伤。
+     */
+    @Synchronized
+    private fun headersForConversation(context: Context, account: Account): MutableMap<String, String> {
+        val session = SessionTracker.sessionFor(context, account.key)
+        val messageId = SessionTracker.newMessageId()
+        return headersFor(account).apply {
+            putAll(ClientIdentity.conversationHeaders(session.conversationId, messageId))
+            // 官方 CLI 的对话请求是 OpenAI Node SDK 发出的，SDK 会自动注入
+            // X-Stainless-* 指纹头；缺了这组头，「自称 CLI 却无 SDK 指纹」本身就是破绽。
+            putAll(ClientIdentity.stainlessHeaders())
+        }
     }
 
     fun refreshToken(context: Context, accountKey: String): Account {
@@ -214,6 +242,7 @@ object NativeCore {
     private fun refreshToken(context: Context, account: Account): Account {
         val refresh = account.auth.optString("refreshToken")
         if (refresh.isBlank()) throw IOException("账号 ${account.uid} 缺少 refreshToken")
+        // token 刷新同样是插件行为，UA 必须与主链路一致（此前此处继承 headersFor 的自曝 UA）。
         val h = headersFor(account).apply { this["X-Refresh-Token"] = refresh; this["X-Auth-Refresh-Source"] = "plugin" }
         return try {
             val payload = executeJson(request("${account.backend}/v2/plugin/auth/token/refresh", "POST", JSONObject(), h))
@@ -224,9 +253,14 @@ object NativeCore {
             if (!fresh.has("expiresAt") && fresh.optLong("expiresIn") > 0) fresh.put("expiresAt", System.currentTimeMillis() + fresh.optLong("expiresIn") * 1000L)
             account.root.put("auth", fresh)
             store(context).clearAccountCooldown(account.key)
+            // 刷新成功即视为账号健康：失败计数必须归零，否则一次网络抖动会永久压低
+            // 该账号的选号权重（权重里成功率因子为 1/(1+failure_count)）。
+            store(context).markAccountSuccess(account.key)
             saveAccount(context, account.root, account.region)
         } catch (e: Exception) {
-            store(context).markAccountFailure(account.key, 60)
+            // 对齐上游 scheduler.do_keepalive：单次刷新失败只计数，连续失败达阈值才真正处罚。
+            // 此前是「失败立刻冷却 60s」，一次网络抖动就把健康账号打进冷却池。
+            store(context).recordRefreshFailure(account.key)
             throw e
         }
     }
@@ -351,14 +385,13 @@ object NativeCore {
     fun refreshModels(context: Context, region: AccountRegion): JSONArray {
         val selected = accountForRequest(context, region)
         val baseHeaders = headersFor(selected)
-        val domain = baseHeaders["X-Domain"].orEmpty().ifBlank { region.defaultDomain }
-            .removePrefix("https://").removePrefix("http://").substringBefore('/')
         val modelHeaders = baseHeaders.toMutableMap().apply {
-            // Browser Origin must match the actual upstream origin. X-Domain remains
-            // the account/tenant routing hint used by the upstream gateway.
-            this["Origin"] = region.backend
-            this["Referer"] = "${region.backend}/"
-            this["User-Agent"] = browserUa
+            // 官方 CLI 不以浏览器身份拉模型目录：product.json 的 platform 就是 "CLI"，
+            // 走的是插件链路。此前这里伪装成浏览器（Origin/Referer/浏览器 UA），
+            // 造成同一账号「拉模型像网页、发对话像插件」的身份撕裂，
+            // 而这正是账号被判异常时最容易被关联的特征。
+            // 现统一保持 CLI 身份，headersFor 已带上完整产品识别头。
+            this["Accept"] = "application/json"
         }
         val payload = try {
             executeJson(request("${region.backend}/console/enterprises/personal/models", "GET", null, modelHeaders))
@@ -492,7 +525,7 @@ object NativeCore {
                 .put("checkin_supported", false).put("credits_refreshed", true)
                 .put("message", "国际版额度由上游自动发放，已刷新当前额度")
         }
-        val h = headersForFresh(context, account).apply { this["User-Agent"] = browserUa }
+        val h = headersForFresh(context, account).apply { this["User-Agent"] = ClientIdentity.BROWSER_UA }
         val data = executeJson(request("${account.backend}/v2/billing/meter/daily-checkin", "POST", JSONObject(), h), allowHttpError = true)
         val msg = data.optString("msg", data.optString("message"))
         val already = msg.contains("已签到") || msg.contains("already checked", true) || msg.contains("already signed", true)
@@ -581,7 +614,9 @@ object NativeCore {
 
     private fun fetchCredits(context: Context, source: Account): JSONObject {
         val account = headersForFresh(context, source)
-        val h = account.apply { this["User-Agent"] = browserUa }
+        // 计费接口必须走浏览器 UA：上游 billing.py:44-47 注释明确网关 WAF 会拦非浏览器 UA
+        // 的计费请求（403/10085）。主链路不得使用此 UA（见 ClientIdentity 注释）。
+        val h = account.apply { this["User-Agent"] = ClientIdentity.BROWSER_UA }
         val bodies = listOf(
             "${source.backend}/billing/meter/get-user-resource-summary" to JSONObject(),
             "${source.backend}/v2/billing/meter/get-user-resource" to JSONObject().put("PageNumber", 1).put("PageSize", 100).put("ProductCode", "p_tcaca").put("Status", JSONArray().put(0).put(3))
@@ -630,13 +665,84 @@ object NativeCore {
         return saveAccount(context, JSONObject().put("region", session.region.id).put("auth", token).put("account", profile), session.region)
     }
 
+    /** 官方 OpenAIProvider 请求体的字段顺序（JSON.stringify 序列化顺序，上游可逐位观测）。 */
+    private val BODY_FIELD_ORDER = listOf(
+        "model", "messages", "tools", "temperature", "top_p", "frequency_penalty",
+        "presence_penalty", "max_tokens", "tool_choice", "parallel_tool_calls",
+        "stream", "stream_options", "store", "prompt_cache_retention", "response_format"
+    )
+
+    /**
+     * 官方固定字段之外、允许透传的模型扩展参数。
+     *
+     * 对应官方的 `...a`（providerData 展开）与 `max_completion_tokens` 替换规则：
+     * 官方按模型能力表把 max_tokens 改名为 max_completion_tokens（o1/o3/o4/gpt-4.1/gpt-5 系），
+     * 那是 RequestRules 的事；这里只保留「模型能力差异参数」本身，不再接受 stop/seed/user/n
+     * 这些官方根本不发的字段——多发一个官方没有的键，比少发更容易被识别。
+     */
+    private val EXTRA_FIELD_ALLOWLIST = setOf(
+        "max_completion_tokens", "reasoning_effort", "verbosity", "reasoning_summary", "thinking"
+    )
+
     fun upstreamRequest(context: Context, body: JSONObject, requiredRegion: AccountRegion): UpstreamCall {
-        val filtered = JSONObject(); val allowed = setOf("model", "messages", "tools", "tool_choice", "temperature", "max_tokens", "max_completion_tokens", "top_p", "stream", "stream_options", "stop", "presence_penalty", "frequency_penalty", "n", "response_format", "seed", "user", "reasoning_effort", "verbosity", "reasoning_summary", "thinking")
-        body.keys().forEach { if (it in allowed) filtered.put(it, body.get(it)) }
+        // 此前这里是「白名单过滤」：把客户端 body 里允许的键拷贝进一个新 JSONObject。
+        // 问题不只是顺序——白名单本身就和官方不一致（官方不发 stop/seed/user/n 等，
+        // 却会发 store/prompt_cache_retention/parallel_tool_calls）。
+        //
+        // 官方请求体（dist/lazy/335.13737b8c.js @177028 OpenAIProvider）是固定字段顺序：
+        //   model → messages → tools(无则整体剔除) → temperature → top_p →
+        //   frequency_penalty → presence_penalty → max_tokens → tool_choice →
+        //   parallel_tool_calls → stream → stream_options → store →
+        //   prompt_cache_retention → ...providerData → response_format(仅存在时)
+        // 已实测 Android JSONObject 底层为 LinkedHashMap：按序 put 即按序序列化，
+        // 且 remove 后再 put 会移到末尾（dex 实测 ORDER2={"a":1,"c":3,"b":9}），
+        // 因此「先按官方顺序搬运 + 事后补默认值」能精确复刻官方字节序。
+        val filtered = JSONObject()
+        BODY_FIELD_ORDER.forEach { key ->
+            if (body.has(key)) {
+                val value = body.opt(key)
+                // 官方用 `tools: i.length ? i : void 0` —— 空数组等于不发该字段。
+                // JSON.stringify 会丢掉 undefined 键，故这里必须整体剔除而非发 []。
+                if (key == "tools" && value is JSONArray && value.length() == 0) return@forEach
+                filtered.put(key, value)
+            }
+        }
         if (!filtered.has("model")) filtered.put("model", "auto")
-        filtered.put("stream", true); if (!filtered.has("stream_options")) filtered.put("stream_options", JSONObject().put("include_usage", true))
+        filtered.put("stream", true)
+        if (!filtered.has("stream_options")) filtered.put("stream_options", JSONObject().put("include_usage", true))
+        // 官方 providerData 展开在固定字段之后（`...a` 位于 response_format 之前），
+        // 这里承接客户端带来的模型扩展参数（reasoning_effort/verbosity 等）。
+        body.keys().forEach { key ->
+            if (key !in BODY_FIELD_ORDER && key in EXTRA_FIELD_ALLOWLIST) filtered.put(key, body.get(key))
+        }
         val account = accountForRequest(context, requiredRegion)
-        return UpstreamCall(request("${account.backend}/v2/chat/completions", "POST", filtered, headersFor(account)), account)
+        // 主对话走会话头版本：官方每一笔对话请求都挂会话上下文，
+        // 这也是「反代看起来像 CLI」最关键的一层（详见 headersForConversation 注释）。
+        val url = "${account.backend}/v2/chat/completions"
+        val headers = headersForConversation(context, account)
+        // 出网取证：记录【最终交给 OkHttp 的那一份】headers/body。
+        //
+        // 为什么要在这里记、而不是在 request() 里统一记：
+        //   request() 还被 token 刷新/拉模型/签到等辅助链路复用，那些请求不带会话头，
+        //   与本比对目标无关，混进去只会稀释信噪比。upstreamRequest 是唯一走
+        //   headersForConversation 的出口，正好对应「主对话出网」这一件事。
+        //
+        // 为什么要复用 isNotEmpty 过滤：
+        //   request() 实际发送时会跳过空值头（headers.forEach { if (v.isNotEmpty()) ... }），
+        //   若记录时不照做，导出文本就会多出「实际没发」的头，比对时反而误导。
+        //   这里复现同一规则，保证「记录 == 出网」。
+        val sentHeaders = LinkedHashMap<String, String>()
+        headers.forEach { (k, v) -> if (v.isNotEmpty()) sentHeaders[k] = v }
+        val bodyText = filtered.toString()
+        RequestInspector.record(
+            context = context,
+            endpoint = url,
+            method = "POST",
+            headers = sentHeaders,
+            body = bodyText,
+            accountKey = account.uid
+        )
+        return UpstreamCall(request(url, "POST", filtered, headers), account)
     }
 
     fun logUsage(context: Context, record: JSONObject): Long = store(context).logUsage(record)
@@ -730,11 +836,7 @@ object NativeCore {
     private fun extractBillingAccounts(data: JSONObject): JSONArray = data.optJSONObject("data")?.optJSONObject("Response")?.optJSONObject("Data")?.optJSONArray("Accounts")
         ?: data.optJSONObject("data")?.optJSONObject("Response")?.optJSONArray("Accounts")
         ?: data.optJSONObject("data")?.optJSONArray("Accounts") ?: data.optJSONArray("Accounts") ?: JSONArray()
-    private fun noAuthHeaders(region: AccountRegion) = mapOf(
-        "X-No-Authorization" to "true", "X-No-User-Id" to "true", "X-No-Enterprise-Id" to "true",
-        "X-No-Department-Info" to "true", "X-Domain" to region.defaultDomain,
-        "User-Agent" to "Workbuddy2API-Android/1.0"
-    )
+    private fun noAuthHeaders(region: AccountRegion) = ClientIdentity.noAuthHeaders(region)
     private fun unwrap(root: JSONObject): JSONObject {
         if (root.has("code") && root.optInt("code", -1) != 0) throw IOException(root.optString("msg", root.optString("message", "上游请求失败")))
         return root.optJSONObject("data")?.optJSONObject("data") ?: root.optJSONObject("data") ?: root
@@ -745,5 +847,22 @@ object NativeCore {
         runCatching { saveAccount(context, JSONObject(raw)) }
     }
     private const val TAG = "NativeCore"
-    private const val browserUa = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/125.0 Mobile Safari/537.36"
+
+    /**
+     * 按 HTTP 状态码决定账号冷却时长。
+     *
+     * 对齐上游 app.py:107-115 的 `_cooldown_for`，该分档在 AGENTS.md 中被列为
+     * 不可删除的设计不变量。此前 Android 版只在 token 刷新失败时固定冷却 60s，
+     * 真正代表「这个号被限了」的 429 打完不留任何痕迹，下一个请求还会选中它。
+     *
+     * 上游原始注释：429 限流若只用 60s 软冷却，账号会反复被限流、UI 在健康/不可用
+     * 间抖动，故限流给 5 分钟；认证类错误（401/403）用 30 分钟。
+     */
+    fun cooldownFor(status: Int): Long = when {
+        status == 429 -> 300L
+        status == 401 || status == 403 -> 1800L
+        status >= 500 -> 120L
+        status > 0 -> 60L
+        else -> 0L
+    }
 }

@@ -211,12 +211,67 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         put("failure_count", 0); put("cooldown_until", 0); put("last_used_at", nowSeconds()); put("updated_at", nowSeconds())
     })
 
+    /**
+     * 统计「健康」账号数：可用 + 不在冷却 + 仍有额度。
+     *
+     * 判定口径与 selectAccount 的候选过滤条件完全一致（对齐上游 pool.healthy()）。
+     * 换号重试前必须先冷却掉刚失败的账号再调用本方法，否则刚失败的号会被自己算进去，
+     * 导致「以为还有健康号 → 换号 → 又选中它」的假重试。
+     */
+    fun countHealthy(region: String? = null): Int = synchronized(lock) {
+        val now = nowSeconds()
+        val regionClause = if (region.isNullOrBlank()) "" else " AND region=?"
+        val regionArgs = if (region.isNullOrBlank()) null else arrayOf(region)
+        var count = 0
+        readableDatabase.rawQuery("SELECT * FROM accounts WHERE enabled=1$regionClause", regionArgs).use { c ->
+            while (c.moveToNext()) {
+                val item = accountJson(c)
+                val hasCredits = item.isNull("credits_remaining") || item.optDouble("credits_remaining") > 0
+                if (hasCredits && item.optDouble("cooldown_until") <= now) count++
+            }
+        }
+        count
+    }
+
     fun markAccountFailure(accountKey: String, cooldownSeconds: Long): Boolean = synchronized(lock) {
         val current = getAccount(accountKey) ?: return@synchronized false
         updateAccount(accountKey, ContentValues().apply {
             put("failure_count", current.optInt("failure_count") + 1)
             put("cooldown_until", nowSeconds() + max(0L, cooldownSeconds)); put("updated_at", nowSeconds())
         })
+    }
+
+    /** token 保活连续失败阈值：对齐上游 scheduler._keepalive_fail_threshold = 3。 */
+    private val KEEPALIVE_FAIL_THRESHOLD = 3
+
+    /**
+     * 记录一次 token 刷新失败。
+     *
+     * 对齐上游 scheduler.do_keepalive：**单次失败只计数、不立刻处罚**，连续失败达阈值
+     * 才真正冷却并禁用账号。上游原注释说得很清楚——立刻处罚会让一次网络抖动
+     * 导致账号「莫名被禁用」。此前 Android 版就是失败即 markAccountFailure(60)。
+     *
+     * @return true 表示已达阈值并已处罚（冷却 + 禁用）；false 表示仅计数
+     */
+    fun recordRefreshFailure(accountKey: String): Boolean = synchronized(lock) {
+        val current = getAccount(accountKey) ?: return@synchronized false
+        val fails = current.optInt("failure_count") + 1
+        if (fails >= KEEPALIVE_FAIL_THRESHOLD) {
+            // session 很可能已失效：冷却 30 分钟并停用，等用户重新登录。
+            // 不自动复活，避免坏 session 持续打上游（对齐上游 set_enabled(false) + 落库）。
+            updateAccount(accountKey, ContentValues().apply {
+                put("failure_count", fails)
+                put("cooldown_until", nowSeconds() + 1800)
+                put("enabled", 0)
+                put("updated_at", nowSeconds())
+            })
+            true
+        } else {
+            updateAccount(accountKey, ContentValues().apply {
+                put("failure_count", fails); put("updated_at", nowSeconds())
+            })
+            false
+        }
     }
 
     fun setAccountCredits(accountKey: String, remaining: Double, total: Double, expireAt: Double? = null, packages: JSONArray = JSONArray()): Boolean =
@@ -235,6 +290,15 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         writableDatabase.update("accounts", values, "region=? AND uid=?", arrayOf(region, uid)) > 0
     }
 
+    /** 无健康账号时的兜底门槛：冷却还需等待超过该秒数则不硬打，由上层转 503。 */
+    private val COOLDOWN_FALLBACK_MAX_WAIT = 30.0
+
+    /** 账号级最小间隔（秒）：对齐上游 ratelimit.py 默认 1.5s。 */
+    private val RATELIMIT_MIN_INTERVAL = 1.5
+
+    /** 最小间隔的随机抖动幅度（秒）：对齐上游 ratelimit.py 默认 ±0.3s。 */
+    private val RATELIMIT_JITTER = 0.3
+
     /** Weighted selection with hard priority for credits expiring within seven days. */
     fun selectAccount(markUsed: Boolean = true, region: String? = null): JSONObject? = synchronized(lock) {
         val now = nowSeconds()
@@ -250,10 +314,24 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         }
         var pool = candidates
         if (pool.isEmpty()) {
+            // 冷却兜底：无健康账号时退回「最早冷却到期」的账号顶班，但它若还要冷却
+            // 超过 30s 就绝不硬打——打上去只会再吃一个 429，形成限流风暴。
+            // 上游实测事故记录见 CODE_REVIEW_TODO.md:195（单账号场景 fallback 反复选中同一账号）。
             readableDatabase.rawQuery("SELECT * FROM accounts WHERE enabled=1$regionClause ORDER BY cooldown_until ASC LIMIT 1", regionArgs).use { c ->
-                if (c.moveToFirst()) pool = mutableListOf(accountJson(c))
+                if (c.moveToFirst()) {
+                    val fallback = accountJson(c)
+                    if (fallback.optDouble("cooldown_until") - now > COOLDOWN_FALLBACK_MAX_WAIT) {
+                        return@synchronized null
+                    }
+                    pool = mutableListOf(fallback)
+                }
             }
         } else {
+            // 账号级限速：过滤掉距上次使用不足 (1.5s ± 0.3s) 的账号，避免同一账号被连续高频打。
+            // 上游是 await 补齐间隔；Android 侧不能阻塞请求线程（客户端会超时），
+            // 故改为「选不带间隔的号」，全部被节流时交回上层 503 明确拒绝。
+            val throttled = pool.filter { accountReadyForSend(it, now) }
+            if (throttled.isNotEmpty()) pool = throttled.toMutableList()
             val urgent = pool.filter { !it.isNull("credits_expire_at") && it.optDouble("credits_expire_at") - now <= 7 * 86400 }
             if (urgent.isNotEmpty()) pool = urgent.toMutableList()
         }
@@ -264,6 +342,21 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         for (i in pool.indices) { pick -= weights[i]; if (pick <= 0) { selected = pool[i]; break } }
         if (markUsed) updateAccount(selected.getString("account_key"), ContentValues().apply { put("last_used_at", now); put("updated_at", now) })
         selected
+    }
+
+    /**
+     * 账号是否已过最小发送间隔（账号级限速）。
+     *
+     * 判定基准是「距上次使用的间隔 ≥ 1.5s 且叠加 ±0.3s 抖动」。抖动值按账号确定性地
+     * 生成而不是每次随机——随机抖动会让同一账号的间隔在 1.2s~1.8s 之间跳变，
+     * 而确定性抖动既保留了「打散固定节拍」的效果，又让判定可复现、便于排查。
+     */
+    private fun accountReadyForSend(a: JSONObject, now: Double): Boolean {
+        val last = a.optDouble("last_used_at", 0.0)
+        if (last <= 0) return true
+        val jitter = ((a.optString("account_key").hashCode() % 7) / 10.0 - 0.3) * RATELIMIT_JITTER / 0.3
+        val required = RATELIMIT_MIN_INTERVAL + jitter
+        return now - last >= required
     }
 
     private fun accountWeight(a: JSONObject, now: Double): Double {
@@ -661,7 +754,35 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         /** 优先级上限：兜底防止误写极端值，让加权随机退化成固定选号。 */
         const val MAX_PRIORITY = 999
         /** saveSettings 只接受本表内的 key，新增配置项必须同时加到 here 与设置页控件。 */
-        private val DEFAULT_SETTINGS = mapOf("checkin_hours" to "9,21", "credit_refresh_min" to "30", "model_refresh_hour" to "6", "model_ttl_min" to "60", "aa_refresh_hour" to "7", "keepalive_hour" to "22", "keepalive_enabled" to "1", "aa_api_key" to "", "usage_retention_days" to "30")
+        /**
+         * 设置白名单。
+         *
+         * 为什么必须有这个白名单：saveSettings 只写「键已在此表」的项，
+         * 用来防止任意键被写进 settings 表（避免脏数据与注入）。
+         *
+         * 注意：任何新增配置项都必须同步加到这里，否则会出现
+         * 「点保存提示成功、但读回永远是旧值」的静默失败 ——
+         * 提示词注入的四项（prompt_mode / prompt_text / sanitize_fingerprints /
+         * use_degraded_prompt）就曾因此完全无法保存。
+         */
+        private val DEFAULT_SETTINGS = mapOf(
+            "checkin_hours" to "9,21",
+            "credit_refresh_min" to "30",
+            "model_refresh_hour" to "6",
+            "model_ttl_min" to "60",
+            "aa_refresh_hour" to "7",
+            "keepalive_hour" to "22",
+            "keepalive_enabled" to "1",
+            "aa_api_key" to "",
+            "usage_retention_days" to "30",
+            // ---- 提示词注入管线（移植自 WorkBuddy 1.2.7）----
+            // prompt_text 默认留空：实际默认值较长且由 PromptInjection.DEFAULT_PROMPT 提供，
+            // 这里留空可以让「用户从未改过」与「用户清空了」两种情况在 UI 层可区分。
+            "prompt_mode" to "custom",
+            "prompt_text" to "",
+            "sanitize_fingerprints" to "1",
+            "use_degraded_prompt" to "false"
+        )
         /**
          * 记录内容字段的入库上限。取值理由：
          * - 输入 4000 字符 ≈ 一整轮较长对话；截断只影响超长多轮历史，日常排查完全够用。
