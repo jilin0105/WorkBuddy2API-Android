@@ -6,10 +6,25 @@ plugins {
 
 android {
     namespace = "com.joy4fire.workbuddy2api"
-    // 必须用字符串版 compileSdkVersion：沙箱内平台目录是 `android-37.0`，
-    // 写成 compileSdk = 37 会去找 `android-37` 并报 platform not found。
-    // 配方来源：太墟 ARM64 PRoot 沙箱 Miuix 构建实测（2026-09）。
-    compileSdkVersion("android-37.0")
+
+    /**
+     * compileSdk 可配置化（逃生口）。
+     *
+     * 默认值 "android-37.0" 与 CI 保持一致，正常情况下无需覆盖。
+     *
+     * 背景（三点都验证过，改这里前请先读）：
+     *   1) 必须用字符串版 compileSdkVersion 而不是 `compileSdk = 37` ——
+     *      后者会去找名为 `android-37` 的目录并报 platform not found；
+     *   2) "android-37.0" 位于 Google 的预览（preview）channel，不在稳定 channel，
+     *      因此 CI 需用 `sdkmanager --channel=3 "platforms;android-37.0"` 安装；
+     *   3) 不能降到 android-36：Miuix 0.9.1 的 AAR 元数据硬性要求 compileSdk >= 37，
+     *      降版会被 checkDebugAarMetadata 直接拒绝。
+     *
+     * 覆盖方式（仅当需要临时换平台时）：
+     *   ./gradlew -PcompileSdk=android-36 :app:assembleDebug
+     */
+    val compileSdkName: String = (project.findProperty("compileSdk") as String?) ?: "android-37.0"
+    compileSdkVersion(compileSdkName)
 
     defaultConfig {
         applicationId = "com.joy4fire.workbuddy2api"

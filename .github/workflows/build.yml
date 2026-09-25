@@ -1,0 +1,139 @@
+name: Build APK
+
+# 触发条件：
+#   · push 到 main（自动打包最新版本，滚动更新 Release）
+#   · 打 v* 标签（产出独立 Release）
+#   · 手动触发（Actions 页面 Run workflow）
+#   · PR 只做编译校验，不产出 Release
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # 同一分支只保留最新一次构建：连续 push 时避免多个构建抢占缓存与 Release
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Assemble debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install platform android-37.0 (preview channel)
+        run: |
+          set -e
+          # 本仓库 compileSdk 为 "android-37.0"：
+          #   · 它位于 Google 的 预览（preview）channel，不在稳定 channel 中 —— 
+          #     稳定 channel 最高只到 android-36，直接 sdkmanager "platforms;android-37" 会失败；
+          #   · 因此必须用 --channel=3（preview）安装同名包 "platforms;android-37.0"。
+          #   · 另外 Miuix 0.9.1 的 AAR 元数据硬性要求 compileSdk >= 37
+          #     （降低到 36 会被 checkDebugAarMetadata 直接拒绝），所以不能降版本绕过。
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --channel=3 "platforms;android-37.0" "build-tools;36.0.0" "platform-tools"
+          echo "--- 已安装平台 ---"
+          sdkmanager --list_installed | sed -n '1,40p'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Write local.properties
+        run: |
+          # local.properties 被 .gitignore 排除（它记录本机 SDK 绝对路径），CI 需自行生成。
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "sdk.dir=$SDK_ROOT" > local.properties
+          cat local.properties
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Collect APK info
+        id: apk
+        run: |
+          set -e
+          APK=$(find app/build/outputs/apk/debug -name '*.apk' | head -1)
+          [ -n "$APK" ] || { echo "未找到 APK 产物"; exit 1; }
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$APK" | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          ls -la "$APK"
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-${{ github.sha }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Rename APK
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: |
+          set -e
+          mkdir -p release-out
+          cp "${{ steps.apk.outputs.path }}" "release-out/WorkBuddy2API-${{ steps.apk.outputs.sha }}.apk"
+          ls -la release-out/
+
+      - name: Publish rolling release (latest-build)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          # 固定 tag 做滚动更新：让它始终只有一个入口，
+          # 不会随着提交数增长堆出一长串历史 Release。
+          tag_name: latest-build
+          name: 最新构建（latest-build）
+          body: |
+            自动构建产出的 debug APK。
+
+            | 项 | 值 |
+            | --- | --- |
+            | 提交 | `${{ github.sha }}` |
+            | 分支 | `main` |
+            | APK 大小 | ${{ steps.apk.outputs.size }} |
+            | compileSdk | android-36（CI 覆盖，仓库默认 37.0，见 build.gradle.kts） |
+
+            > 使用 debug 签名。本仓库为本地自用网关工具，不发布应用商店。
+            > 安装前请先卸载设备上的旧版本，或确认签名一致。
+          files: release-out/*.apk
+          make_latest: true
+
+      - name: Publish tag release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            标签 `${{ github.ref_name }}` 的构建产物。
+
+            - 提交：`${{ github.sha }}`
+            - APK 大小：${{ steps.apk.outputs.size }}
+          files: release-out/*.apk
+          generate_release_notes: true
