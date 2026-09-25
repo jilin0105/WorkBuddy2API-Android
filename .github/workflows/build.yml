@@ -39,18 +39,34 @@ jobs:
 
       - name: Set up Android SDK
         run: |
-          set -e
-          # 不使用 android-actions/setup-android：它内部会执行 `sdkmanager tools`，
-          # 而新版 cmdline-tools 已移除此包，导致该 action 直接失败
-          # （日志：Warning: Failed to find package 'tools' → exit code 1）。
-          # GitHub 的 ubuntu runner 已预装 Android SDK 与 cmdline-tools，直接用即可。
+          # 这里刻意不用 set -e：探测 sdkmanager 的过程中允许部分命令失败
+          # （例如某个候选路径不存在），失败信息只作为诊断线索保留。
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "SDK 根目录：$SDK_ROOT"
+          echo "--- cmdline-tools 布局 ---"
+          ls -la "$SDK_ROOT/cmdline-tools" || true
+
+          # 探测顺序（runner 镜像版本不同，布局会有差异）：
+          #   1) cmdline-tools/latest/bin/sdkmanager（官方推荐位置）
+          #   2) cmdline-tools/<任意版本>/bin/sdkmanager
+          #   3) 任意名为 sdkmanager 的可执行文件
+          SDKMANAGER=""
+          for candidate in \
+            "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "$SDK_ROOT/cmdline-tools"/*/bin/sdkmanager \
+            "$SDK_ROOT/tools/bin/sdkmanager"; do
+            if [ -x "$candidate" ]; then SDKMANAGER="$candidate"; break; fi
+          done
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$SDK_ROOT" -name sdkmanager -type f 2>/dev/null | head -1)
+          fi
+          if [ -z "$SDKMANAGER" ]; then
+            echo "未找到 sdkmanager，尝试用 sdkmanager 命令自身"; SDKMANAGER="sdkmanager"
+          fi
+          echo "sdkmanager：$SDKMANAGER"
+
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
-          # 把 cmdline-tools 下的 sdkmanager 加入 PATH，保证后续步骤能直接调用
-          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" -maxdepth 2 -name sdkmanager -type f 2>/dev/null | head -1)
-          echo "sdkmanager：$SDKMANAGER"
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
           echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
 
