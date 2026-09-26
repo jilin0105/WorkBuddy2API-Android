@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -139,10 +140,17 @@ fun PcInputDialog(
 
 /**
  * 明细查看对话框：等宽文本 + 一键复制。
- * 用于「查看 API Key」「出网取证明细」「存储占用明细」。
+ * 用于「查看 API Key」「出网取证明细」「存储占用明细」「保活状态检查」。
  *
- * 用等宽字的理由：这些内容都是要逐字节比对/肉眼扫字段顺序的（headers、JSON、Key），
- * 比例字体下很容易看错行。
+ * ⚠️ 超长文本处理（本函数最重要的约束）：
+ *   出网取证的 body 是【完整请求体】，一条就可能达到几十到上百 KB。
+ *   把这么长的字符串整个交给 Text() 渲染会直接闪退 —— 原因不是长度本身，
+ *   而是 Compose 会对整段文本做分词与布局测量，单帧工作量大到触发
+ *   「GL 上下文丢失 / 渲染超时」并让进程被杀（表现为"点某条日志就闪退"）。
+ *   因此这里在渲染前先做长度上限裁剪，并明确告知用户已截断、可用「复制」拿全文。
+ *
+ *   注意限制只作用于【显示】：「复制」始终复制完整原文，
+ *   因为取证文本的用途就是整段贴进 diff 工具比对。
  */
 @Composable
 fun PcDetailDialog(
@@ -154,6 +162,15 @@ fun PcDetailDialog(
     onCopy: (() -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
+    // 渲染上限：按字符数裁剪。取 20000 字符是权衡后的值 ——
+    // 足以完整显示绝大多数 Key / 存储报告 / 状态检查，
+    // 又远低于会让 Compose 布局测量卡死的量级（实测 100KB+ 必崩）。
+    val display = remember(body) {
+        if (body.length <= DETAIL_DISPLAY_LIMIT) body
+        else body.take(DETAIL_DISPLAY_LIMIT) +
+            "\n\n… 已省略 ${body.length - DETAIL_DISPLAY_LIMIT} 字符（共 ${body.length} 字符）\n" +
+            "点击下方「${copyLabel ?: "复制"}」可获取完整内容。"
+    }
     WindowDialog(
         show = show,
         title = title,
@@ -164,7 +181,7 @@ fun PcDetailDialog(
                     Modifier.fillMaxWidth().heightIn(max = 380.dp).verticalScroll(rememberScrollState())
                 ) {
                     Text(
-                        text = body,
+                        text = display,
                         style = MiuixTheme.textStyles.body2,
                         fontFamily = if (mono) FontFamily.Monospace else null
                     )
@@ -184,3 +201,6 @@ fun PcDetailDialog(
         }
     )
 }
+
+/** 明细弹窗的渲染长度上限（字符）。超过则截断显示，但不影响复制全文。 */
+private const val DETAIL_DISPLAY_LIMIT = 20_000

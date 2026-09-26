@@ -264,6 +264,18 @@ fun AccountsScreen(context: Context, app: AppState) {
                                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary
                                 )
                             }
+                            // 本次到账的积分单独一行高亮：这是签到最核心的结果，
+                            // 混在说明文案里不容易看见。
+                            if (!result.isNull("credits_gained")) {
+                                val gained = result.optDouble("credits_gained", 0.0)
+                                if (gained != 0.0) {
+                                    Text(
+                                        "本次 " + if (gained > 0) "+%.1f".format(gained) else "%.1f".format(gained) + " 积分",
+                                        style = MiuixTheme.textStyles.main,
+                                        color = if (gained > 0) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.error
+                                    )
+                                }
+                            }
                         }
                     }
                 }

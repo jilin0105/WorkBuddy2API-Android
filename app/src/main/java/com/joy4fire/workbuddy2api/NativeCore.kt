@@ -517,6 +517,21 @@ object NativeCore {
         return token.toDoubleOrNull()?.takeIf { it.isFinite() }
     }
 
+    /**
+     * 单账号签到。
+     *
+     * 与 WorkBuddy 1.2.7 的语义对齐（a.C0045h2 中的 daily-checkin 实现）：
+     *   1) 签到【前】先记下当前剩余额度（credits_before）；
+     *   2) 调 /v2/billing/meter/daily-checkin；
+     *   3) 签到【后】重新查询额度（credits_remaining / credits_total）；
+     *   4) 把前后差值与总额度一并返回。
+     *
+     * 为什么要做第 1 步与第 3 步：
+     *   签到接口本身【不返回积分】，它只负责"打卡"这一动作。积分是否到账、
+     *   到账多少，只能通过对比签到前后的额度快照才能看出来。原实现只调了签到
+     *   接口、既不记快照也不复查，界面因此永远显示不出"今天签到得了多少分"，
+     *   看起来就像"签到了但没拿到积分"。
+     */
     fun checkIn(context: Context, accountKey: String): JSONObject {
         val account = loadAccount(context, accountKey) ?: throw IOException("账号不存在：$accountKey")
         if (account.region == AccountRegion.INTERNATIONAL) {
@@ -525,18 +540,78 @@ object NativeCore {
                 .put("checkin_supported", false).put("credits_refreshed", true)
                 .put("message", "国际版额度由上游自动发放，已刷新当前额度")
         }
+
+        // ① 签到前快照：从本地已缓存的额度取，取不到则为 null（明确区分"没查到"与"是 0"）
+        val before = readCachedCredits(context, account.key)
+
         val h = headersForFresh(context, account).apply { this["User-Agent"] = ClientIdentity.BROWSER_UA }
-        val data = executeJson(request("${account.backend}/v2/billing/meter/daily-checkin", "POST", JSONObject(), h), allowHttpError = true)
+        val data = executeJson(
+            request("${account.backend}/v2/billing/meter/daily-checkin", "POST", JSONObject(), h),
+            allowHttpError = true
+        )
         val msg = data.optString("msg", data.optString("message"))
         val already = msg.contains("已签到") || msg.contains("already checked", true) || msg.contains("already signed", true)
-        if (data.optInt("code", -1) == 0 || already) {
-            store(context).setCheckinDate(account.key, SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()))
-            store(context).clearAccountCooldown(account.key)
-            return JSONObject().put("uid", account.uid).put("account_key", account.key).put("region", account.region.id).put("region_label", account.region.label).put("nickname", account.nickname)
-                .put("ok", true).put("already", already).put("checkin_supported", true)
-                .put("message", if (already) "今日已签到" else "签到成功")
+        val ok = data.optInt("code", -1) == 0 || already
+        if (!ok) throw IOException(if (msg.isBlank()) "签到失败" else msg)
+
+        store(context).setCheckinDate(account.key, SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()))
+        store(context).clearAccountCooldown(account.key)
+
+        // ② 签到后复查额度：这一步同时把最新额度写回账号缓存，界面无需再手动刷新。
+        // 注意字段名是 remain / total（refreshCredits → fetchCredits 的返回约定），
+        // 不是 credits_remaining —— 后者是账号列表接口里的字段，两者容易混。
+        val after = runCatching { refreshCredits(context, account.key) }.getOrNull()
+        val remaining = after?.optDouble("remain")
+        val total = after?.optDouble("total")
+        val gained = if (before != null && remaining != null) remaining - before else null
+
+        return JSONObject()
+            .put("uid", account.uid).put("account_key", account.key)
+            .put("region", account.region.id).put("region_label", account.region.label)
+            .put("nickname", account.nickname)
+            .put("ok", true).put("already", already).put("checkin_supported", true)
+            .put("credits_before", before ?: JSONObject.NULL)
+            .put("credits_remaining", remaining ?: JSONObject.NULL)
+            .put("credits_total", total ?: JSONObject.NULL)
+            .put("credits_gained", gained ?: JSONObject.NULL)
+            .put("message", buildCheckinMessage(already, before, remaining, gained))
+    }
+
+    /**
+     * 拼签到结果文案。
+     *
+     * 文案分四种情况，核心是【不谎报】：查不到额度就说查不到，
+     * 而不是显示成 0 分（那会让人以为签到没生效）。
+     */
+    private fun buildCheckinMessage(
+        already: Boolean,
+        before: Double?,
+        remaining: Double?,
+        gained: Double?
+    ): String {
+        val head = if (already) "今日已签到" else "签到成功"
+        val remainText = remaining?.let { "%.1f".format(it) }
+        return when {
+            gained != null && gained > 0 ->
+                "$head，本次 +%.1f 积分（当前剩余 $remainText）".format(gained)
+            gained != null && gained == 0.0 ->
+                "$head，额度未变化（当前剩余 $remainText；签到额可能需要随后续活跃行为才计分）"
+            gained != null ->
+                "$head，额度减少 %.1f（当前剩余 $remainText）".format(-gained)
+            remaining != null ->
+                "$head，当前剩余 $remainText（缺少签到前快照，无法计算本次增量）"
+            else ->
+                "$head（额度查询失败，请稍后在账号页刷新）"
         }
-        throw IOException(if (msg.isBlank()) "签到失败" else msg)
+    }
+
+    /** 读取本地缓存的剩余额度；未刷新过则返回 null。 */
+    private fun readCachedCredits(context: Context, accountKey: String): Double? {
+        val account = loadAccount(context, accountKey) ?: return null
+        val raw = account.profile
+        if (raw.isNull("credits_remaining")) return null
+        val value = raw.optDouble("credits_remaining", Double.NaN)
+        return if (value.isFinite()) value else null
     }
 
     fun checkInAll(context: Context): JSONObject {

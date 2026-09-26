@@ -310,6 +310,9 @@ class AppState(private val context: Context) {
         val response = NativeCore.checkInAll(context)
         val results = response.optJSONArray("results") ?: JSONArray()
         checkinResults = results
+        // 签到会改变额度（并在服务端侧复查后写回本地缓存），因此顺带刷新账号列表，
+        // 否则账号页仍显示签到前的旧额度，看起来像"签到了却没拿到积分"。
+        loadAccounts()
         bump()
         val success = (0 until results.length()).count { results.optJSONObject(it).optBoolean("ok") }
         val failed = (0 until results.length()).count {
@@ -317,7 +320,17 @@ class AppState(private val context: Context) {
             !item.optBoolean("ok") && !item.optBoolean("skipped")
         }
         val skipped = results.length() - success - failed
-        "签到完成：成功/已签 $success，失败 $failed" + if (skipped > 0) "，跳过 $skipped" else ""
+        // 汇总本次实际到账的积分（仅统计成功且能算出增量的账号）
+        val gained = (0 until results.length()).sumOf { i ->
+            val item = results.optJSONObject(i) ?: return@sumOf 0.0
+            if (item.isNull("credits_gained")) 0.0 else item.optDouble("credits_gained", 0.0)
+        }
+        buildString {
+            append("签到完成：成功/已签 $success，失败 $failed")
+            if (skipped > 0) append("，跳过 $skipped")
+            append("；本次合计 +").append("%.1f".format(gained)).append(" 积分")
+            append("（详情见账号页）")
+        }
     }
 
     fun refreshModels() = task("刷新模型") {

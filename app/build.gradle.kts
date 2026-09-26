@@ -30,8 +30,10 @@ android {
         applicationId = "com.joy4fire.workbuddy2api"
         minSdk = 24
         targetSdk = 36
-        versionCode = 5
-        versionName = "1.2.0-native-miuix"
+        // 版本号随功能变更递增：便于在设备上区分"是否装上的是新版"
+        // （同 versionCode 覆盖安装后，界面上无从判断装的是哪一版）。
+        versionCode = 6
+        versionName = "1.2.1-dev"
     }
 
     buildTypes {

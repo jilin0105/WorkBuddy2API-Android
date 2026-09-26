@@ -187,15 +187,14 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                 PcInfoRow("本地端口", ApiHostService.PORT.toString())
                 PcInfoRow("国内后端", NativeCore.BACKEND)
                 PcInfoRow("国际后端", NativeCore.INTERNATIONAL_BACKEND)
-                PcInfoRow("版本", "1.2.0-native-miuix")
+                PcInfoRow("版本", installedVersion(context))
             }
         }
     }
 }
 
 /** 悬浮球状态说明（把「开关」与「权限」分开说，否则用户会困惑于"开了却没效果"）。 */
-private fun AppState.floatingStateText(): String {
-    val enabled = floatingEnabled()
+private fun AppState.floatingStateText(): String {    val enabled = floatingEnabled()
     val permitted = floatingPermitted()
     return when {
         !enabled -> "未启用。启用后需授予「显示在其他应用上层」权限。"
@@ -237,3 +236,17 @@ private fun SettingField(
         }
     }
 }
+
+/**
+ * 读取本机已安装的版本名。
+ *
+ * 为什么从 PackageManager 读而不是用 BuildConfig：
+ *   本项目未开启 buildConfig 生成，且这样读到的就是【设备上实际运行的版本】——
+ *   排查"是否装上了新版"时，这比读编译期常量更可信。
+ */
+private fun installedVersion(context: Context): String = runCatching {
+    val info = context.packageManager.getPackageInfo(context.packageName, 0)
+    // longVersionCode 需要 API 28+，minSdk 为 24，故低版本回退到 versionCode。
+    val code = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else @Suppress("DEPRECATION") info.versionCode.toLong()
+    "${info.versionName} ($code)"
+}.getOrDefault("未知")
