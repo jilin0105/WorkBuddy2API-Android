@@ -133,6 +133,20 @@ jobs:
           cp "${{ steps.apk.outputs.path }}" "release-out/WorkBuddy2API-${{ steps.apk.outputs.sha }}.apk"
           ls -la release-out/
 
+      - name: Delete previous release assets
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 滚动 Release 若不清理，资产会不断累积（每次构建都新增一个 APK），
+          # 下载页就会出现多个版本、用户容易拿到旧的。
+          # 这里在发布前删掉该 tag 下已有的全部资产，保证只保留本次构建的 APK。
+          existing=$(gh release view latest-build --json assets --jq '.assets[].name' 2>/dev/null || true)
+          for name in $existing; do
+            echo "删除旧资产：$name"
+            gh release delete-asset latest-build "$name" --yes 2>/dev/null || true
+          done
+
       - name: Publish rolling release (latest-build)
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
