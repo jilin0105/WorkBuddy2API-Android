@@ -269,9 +269,25 @@ class GrowthCenter(private val api: GrowthApi, private val tasks: GrowthTasks) {
             .put("region", account?.region?.id ?: "domestic")
             .put("region_label", account?.region?.label ?: "国内版")
 
-        // 国际版无成长体系，直接返回（1.2.7 `a.r2.j` 同样短路）
+        // 国际版【也有】成长任务，不能直接短路返回。
+        //
+        // 真机核对：国际版账号调用 /v2/activity/growth/tasks 会正常返回任务
+        // （first_chat / skill_installed / wechat_linked / expert_summoned / template_used）。
+        // 早先照搬 1.2.7 的短路写法，导致页面自相矛盾：顶部写"国际版无成长体系"，
+        // 下面却列出 5 个成长任务。
+        //
+        // 国际版真正缺少的是国内版专属活动（连登/补签/抽奖/猫猫/开学季），
+        // 因此这里改为：照常查询任务，只是不列那些专属项。
         if (account?.region == AccountRegion.INTERNATIONAL) {
-            claimable.put("国际版无成长体系（只有每日额度与试用加油包）")
+            runCatching { tasks.list(accountKey) }
+                .onSuccess { list ->
+                    val ready = list.count { it.claimable }
+                    result.put("growth_total", list.size).put("growth_claimable", ready)
+                        .put("growth_claimed", list.count { it.claimed })
+                    if (ready > 0) claimable.put("成长任务奖励 $ready 项")
+                }
+                .onFailure { errors.put("成长任务：${it.message}") }
+            claimable.put("国际版无国内版专属活动（连登 / 抽奖 / 猫猫 / 开学季）")
             return result.put("international", true).put("claimable", claimable)
                 .put("claimable_count", claimable.length()).put("errors", errors)
         }

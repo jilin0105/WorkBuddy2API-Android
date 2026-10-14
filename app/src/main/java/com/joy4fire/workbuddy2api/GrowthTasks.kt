@@ -85,6 +85,10 @@ class GrowthTasks(private val api: GrowthApi) {
     fun list(accountKey: String): List<Task> {
         val root = api.plugin(accountKey, "/v2/activity/growth/tasks")
         val tasks = root.optJSONArray("tasks") ?: return emptyList()
+        // 打印上游原始任务清单：任务码会随上游迭代变化（已发生过一次全表更换），
+        // 排查"某任务未适配/不达标"时，这条日志能直接给出真实字段与描述，
+        // 无需改代码重编。用 logcat -s WbGrowth:I 查看。
+        android.util.Log.i("WbGrowth", "raw tasks = $tasks")
         val result = ArrayList<Task>(tasks.length())
         for (i in 0 until tasks.length()) {
             val item = tasks.optJSONObject(i) ?: continue

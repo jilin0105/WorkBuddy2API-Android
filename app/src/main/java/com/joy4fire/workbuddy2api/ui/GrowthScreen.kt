@@ -134,10 +134,8 @@ fun GrowthScreen(context: Context, accountKey: String?) {
                     s == null && error == null -> Text("加载中…", style = MiuixTheme.textStyles.main)
                     s == null -> Text("加载失败：$error", style = MiuixTheme.textStyles.main,
                         color = MiuixTheme.colorScheme.error)
-                    s.optBoolean("international") -> Text(
-                        "国际版无成长体系（只有每日额度与试用加油包）。",
-                        style = MiuixTheme.textStyles.main
-                    )
+                    // 国际版同样有成长任务，不能再显示"无成长体系"这种与下方任务列表
+                    // 自相矛盾的文案；改为与国内版一致地展示 claimable 清单。
                     else -> {
                         val arr = s.optJSONArray("claimable")
                         if (arr == null || arr.length() == 0) {

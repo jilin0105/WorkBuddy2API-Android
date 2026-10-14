@@ -20,7 +20,28 @@ class GrowthRunner(
     private var currentReporter: GrowthTasks.Reporter? = null
 
     /** 任务总表：code → (说明, 执行体)。1.2.7 `a.n2.f840d` 的完整映射。 */
+    /**
+     * 上游任务码 → 客户端实现。
+     *
+     * ⚠️ 键必须是【上游真实返回的 code】（2026-10 真机核对），不是旧版 1.2.7 的码。
+     * 历史教训：此前整张表用的都是 1.2.7 时代的码（chat_5 / template_5 / skill_1 …），
+     * 而上游早已改成 first_chat / template_used / skill_installed …，两者无一匹配，
+     * 于是所有任务都落进"未适配"分支 —— 用户看到的就是「好多任务都失效了」。
+     *
+     * 说明：下面按【语义】把新码映射到已有实现。语义相近不代表上游判定口径完全相同
+     * （任务码变更通常伴随计分规则调整），因此若某个任务执行后仍未达标，
+     * 需要抓取该任务的真实埋点要求再对齐，不能默认一次映射就永久有效。
+     */
     private val handlers: Map<String, Pair<String, (String) -> String>> = mapOf(
+        // ---------------- 当前线上真实任务码 ----------------
+        "first_chat" to ("完成一次对话（真实对话 + 活跃上报）" to ::firstChat),
+        "skill_installed" to ("完成技能安装（真实对话 + skill_info 事件）" to ::skillLoad),
+        "expert_summoned" to ("召唤专家（真实专家召唤 + 使用链）" to { key -> expertChain(key, "agent", 1) }),
+        "template_used" to ("使用模板（template_used 事件组）" to ::templates),
+        // wechat_linked「关联微信」需要真实的微信 OAuth 绑定，客户端无法伪造，
+        // 故刻意不提供实现：让它走"未适配"分支明确告知，而不是假装成功。
+
+        // ---------------- 旧版 1.2.7 任务码（保留兼容） ----------------
         "chat_5" to ("补报 5 条对话活跃事件" to ::chat5),
         "first_buddy" to ("前置上报 → 同意协议 → 领养第一只 Buddy" to ::firstBuddy),
         "Model_chat_GLM5.2" to ("接受任务 → glm-5.2 真实对话 → 对齐模型上报" to ::glm52),
@@ -47,14 +68,6 @@ class GrowthRunner(
 
     // ================================================================ 编排入口
 
-    /**
-     * 一键执行（1.2.7 `a.n2.l`：批量接受 → 逐个执行）。返回逐项结果。
-     *
-     * 顺序严格对齐 1.2.7：
-     *   ① 先批量 accept 所有 pending 任务（不做这一步，后续埋点可能不计分）；
-     *   ② 再按任务表逐个跑；
-     *   ③ 每步之间 sleep 1050ms——这是 1.2.7 的经验值，太密会被判为机器行为。
-     */
     /**
      * 一键执行全部任务。
      *
@@ -93,9 +106,12 @@ class GrowthRunner(
             if (only != null && task.code !in only) continue
             val entry = handlers[task.code]
             if (entry == null) {
-                // 未适配：不静默跳过，而是明确告知，便于对照上游补充实现
+                // 未适配：不静默跳过，而是把【上游自己的任务标题】一并带出来 ——
+                // 光有任务码（如 wechat_linked）用户看不出要做什么，
+                // 带上标题（如"关联微信"）才能判断是"需要客户端交互"还是"实现缺失"。
                 unmapped++
-                results.put(result(task.code, "unmapped", "尚未适配该任务（上游有此任务，客户端暂无对应行为）"))
+                val label = task.title.ifBlank { task.code }
+                results.put(result(task.code, "unmapped", "「$label」尚未适配（上游有此任务，客户端暂无对应行为）"))
                 continue
             }
             if (task.claimed) {
@@ -145,7 +161,23 @@ class GrowthRunner(
         } finally { currentReporter = null }
     }
 
-    // ================================================================ 17 条任务链
+    // ================================================================ 任务链
+
+    /**
+     * first_chat「完成一次对话」：发一次真实对话并补报活跃事件。
+     *
+     * 为什么两件事都做：任务码由旧版的 chat_5 变为 first_chat，判定口径可能一并调整。
+     * 「真实对话」满足"完成对话"的字面要求，「活跃上报」覆盖按埋点计分的可能，
+     * 做全套比只做一件更不容易漏判。
+     */
+    private fun firstChat(accountKey: String): String {
+        val receipt = realConversation(accountKey, "")
+        api.reportMiniProgram(
+            accountKey,
+            listOf(events.chatRequestSend(receipt.first, "deepseek-v4-flash", "deepseek-v4-flash"))
+        )
+        return "已完成一次真实对话并上报（会话 ${receipt.first}）"
+    }
 
     /** chat_5：补报对话活跃事件（1.2.7 case 0）。 */
     private fun chat5(accountKey: String): String {
