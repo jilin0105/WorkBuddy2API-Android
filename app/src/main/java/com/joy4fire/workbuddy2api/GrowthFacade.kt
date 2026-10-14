@@ -49,6 +49,10 @@ object GrowthFacade {
     fun claim(context: Context, accountKey: String, code: String): Pair<Long, Long> =
         bundle(context).tasks.claim(accountKey, code)
 
+    /** 领取任务奖励（结构化结果，含"是否已领/是否真有积分"）。 */
+    fun claimDetailed(context: Context, accountKey: String, code: String): GrowthTasks.ClaimResult =
+        bundle(context).tasks.claimDetailed(accountKey, code)
+
     /** 状态汇总：今天还能白拿什么。 */
     fun summary(context: Context, accountKey: String): JSONObject = bundle(context).center.summary(accountKey)
 

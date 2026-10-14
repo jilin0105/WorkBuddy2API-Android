@@ -55,6 +55,23 @@ class GrowthRunner(
      *   ② 再按任务表逐个跑；
      *   ③ 每步之间 sleep 1050ms——这是 1.2.7 的经验值，太密会被判为机器行为。
      */
+    /**
+     * 一键执行全部任务。
+     *
+     * 【为什么改成遍历上游任务，而不是遍历 handlers 码表】
+     * 旧实现是「for (code in handlers)」，也就是拿代码里硬编码的 17 个任务码
+     * 去上游列表里逐个找。后果是单向的：
+     *   · 上游新增任务 → 代码里没有 → 永远不执行（用户看到一堆任务没反应）
+     *   · 上游改动/下架任务码 → 匹配不上 → 全部落到"该账号无此任务"分支，
+     *     表现为「好多任务都失效了」，但真实原因是码表过期，不是账号没有任务。
+     * 现在改为「以服务端返回的任务列表为准」逐个驱动：
+     *   · 上游有什么就处理什么，新增任务无需改代码即可被发现；
+     *   · 有适配实现的直接执行；
+     *   · 没有适配实现的，明确标记为「未适配」并把任务码回显给用户，
+     *     便于对照补充，而不是静默跳过。
+     *
+     * @param only 仅执行这些任务码（null 表示全部）
+     */
     fun runAll(accountKey: String, blocks: GrowthTasks.Reporter, only: Set<String>? = null): JSONArray {
         currentReporter = blocks
         val results = JSONArray()
@@ -70,26 +87,45 @@ class GrowthRunner(
             api.sleep(1050)
         }
 
-        // ② 逐个执行
-        for ((code, entry) in handlers) {
-            if (only != null && code !in only) continue
-            val task = snapshot.firstOrNull { it.code == code }
-            if (task == null) {
-                results.put(result(code, "skipped", "该账号无此任务")); continue
+        // ② 以服务端任务列表为准逐个执行
+        var unmapped = 0
+        for (task in snapshot) {
+            if (only != null && task.code !in only) continue
+            val entry = handlers[task.code]
+            if (entry == null) {
+                // 未适配：不静默跳过，而是明确告知，便于对照上游补充实现
+                unmapped++
+                results.put(result(task.code, "unmapped", "尚未适配该任务（上游有此任务，客户端暂无对应行为）"))
+                continue
             }
-            if (task.accepted) {
-                results.put(result(code, "skipped", "已完成（${task.progressText}）")); continue
+            if (task.claimed) {
+                results.put(result(task.code, "skipped", "已领取过奖励")); continue
             }
-            blocks.report("$code…")
-            // handlers 的 value 是 (说明, 执行体) 二元组，这里要的是执行体。
+            blocks.report("${task.code}…")
             val outcome = runCatching { entry.second(accountKey) }
             results.put(
                 outcome.fold(
-                    onSuccess = { result(code, "done", it) },
-                    onFailure = { result(code, "error", it.message ?: "执行失败") }
+                    onSuccess = { result(task.code, "done", it) },
+                    onFailure = { result(task.code, "error", it.message ?: "执行失败") }
                 )
             )
             api.sleep(1050)
+        }
+
+        // ③ 领奖阶段：执行完的行为可能有任务已达标，这里统一尝试领一次
+        val claimable = runCatching { tasks.list(accountKey) }.getOrDefault(emptyList())
+            .filter { it.claimable && (only == null || it.code in only) }
+        for (task in claimable) {
+            blocks.report("领取 ${task.code}…")
+            val claimed = runCatching { tasks.claimDetailed(accountKey, task.code) }.getOrNull()
+            if (claimed != null) {
+                results.put(result(task.code, "claimed", claimed.describe()))
+            }
+            api.sleep(600)
+        }
+
+        if (unmapped > 0) {
+            blocks.report("有 $unmapped 个上游任务尚未适配")
         }
         currentReporter = null
         return results

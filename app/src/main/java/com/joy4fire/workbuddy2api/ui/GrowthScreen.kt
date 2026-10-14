@@ -223,8 +223,11 @@ fun GrowthScreen(context: Context, accountKey: String?) {
                     task = tasks[index],
                     onClaim = {
                         run("领取 ${tasks[index].code}…") {
-                            val (credit, _) = GrowthFacade.claim(context, accountKey, tasks[index].code)
-                            if (credit == 0L) "该奖励已领取过" else "已领 $credit 分"
+                            // 用结构化结果区分「已领过」「真有积分」「成功但上游没发奖励」。
+                            // 旧实现把 credit==0 一律说成"已领取过"，导致
+                            // 「领到了但没积分」和「确实领过了」两种情况无法分辨 ——
+                            // 用户反馈的"领取任务不提示是否有积分"就是这个原因。
+                            GrowthFacade.claimDetailed(context, accountKey, tasks[index].code).describe()
                         }
                     },
                     onRun = {
@@ -310,7 +313,9 @@ private fun flattenResults(results: JSONArray): List<String> = buildList {
         val item = results.optJSONObject(i) ?: continue
         val mark = when (item.optString("status")) {
             "done" -> "✓"
+            "claimed" -> "★"     // 领奖成功（可能与"执行"分开显示）
             "skipped" -> "·"
+            "unmapped" -> "△"    // 上游有该任务，但客户端尚未适配
             "error" -> "✗"
             else -> "?"
         }

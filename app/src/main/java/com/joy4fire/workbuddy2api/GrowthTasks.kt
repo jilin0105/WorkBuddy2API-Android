@@ -139,11 +139,54 @@ class GrowthTasks(private val api: GrowthApi) {
      * already_claimed 返回 (0,0) 而不是抛错——重跑时这不是异常状态，
      * 把它当错误会让「一键做完」在第二次执行时整体失败。
      */
-    fun claim(accountKey: String, code: String): Pair<Long, Long> {
+    /**
+     * 领取单个任务奖励，返回结构化结果。
+     *
+     * 为什么要结构化而不是只回 (credit, energy)：
+     *   旧实现把「已领取」「领取成功但奖励为 0」「奖励是真的 0 分」三种情况
+     *   统一压成 (0,0)，UI 无法区分，用户看到的就是"领了但没提示有没有积分"。
+     *   这里把状态、积分、能量、原始响应都带出来，让界面能明确说明结果。
+     */
+    data class ClaimResult(
+        val alreadyClaimed: Boolean,
+        val credit: Long,
+        val energy: Long,
+        val raw: JSONObject
+    ) {
+        /** 是否有实际奖励入账。 */
+        val hasReward: Boolean get() = credit > 0 || energy > 0
+
+        /** 给界面直接显示的结果文案。 */
+        fun describe(): String = when {
+            alreadyClaimed -> "奖励此前已领取过，本次无新增"
+            hasReward -> buildString {
+                append("已领取")
+                if (credit > 0) append(" +$credit 积分")
+                if (energy > 0) append(" +$energy 能量")
+            }
+            // 领到成功响应但没有积分：如实说明，避免用户误以为失败了反复点
+            else -> "领取成功，但该任务未发放积分/能量（上游奖励为 0）"
+        }
+    }
+
+    /** 领取任务奖励（结构化返回，含是否已领、积分、能量）。 */
+    fun claimDetailed(accountKey: String, code: String): ClaimResult {
         val encoded = java.net.URLEncoder.encode(code, "UTF-8")
         val data = api.web(accountKey, "/activity/growth/tasks/$encoded/claim", "POST", JSONObject())
-        if (data.optBoolean("already_claimed")) return 0L to 0L
-        return data.optLong("credit", 0) to data.optLong("energy", 0)
+        val already = data.optBoolean("already_claimed")
+        val credit = if (already) 0L else data.optLong("credit", 0)
+        val energy = if (already) 0L else data.optLong("energy", 0)
+        // 记入积分账本：领奖是"奖励积分"的主要来源，与签到分开归类，
+        // 这样积分详情里能明确显示"奖励得了多少"。
+        if (credit != 0L) {
+            NativeCore.recordCredit(api.appContextCompat(), accountKey, "task", credit.toDouble(), "任务奖励 $code")
+        }
+        return ClaimResult(alreadyClaimed = already, credit = credit, energy = energy, raw = data)
+    }
+
+    fun claim(accountKey: String, code: String): Pair<Long, Long> {
+        val result = claimDetailed(accountKey, code)
+        return result.credit to result.energy
     }
 
     /**
@@ -170,10 +213,20 @@ class GrowthTasks(private val api: GrowthApi) {
     }
 
     /** 新手礼包（1.2.7 `a.n2.i`）。 */
-    fun claimGift(accountKey: String): Long =
-        api.plugin(accountKey, "/billing/meter/claim-gift", "POST", JSONObject()).optLong("credit", 0)
+    fun claimGift(accountKey: String): Long {
+        val credit = api.plugin(accountKey, "/billing/meter/claim-gift", "POST", JSONObject()).optLong("credit", 0)
+        if (credit != 0L) {
+            NativeCore.recordCredit(api.appContextCompat(), accountKey, "gift", credit.toDouble(), "新手礼包")
+        }
+        return credit
+    }
 
     /** 活动补偿（1.2.7 `a.n2.h`）。 */
-    fun claimCompensation(accountKey: String): Long =
-        api.plugin(accountKey, "/billing/meter/claim-compensation", "POST", JSONObject()).optLong("credit", 0)
+    fun claimCompensation(accountKey: String): Long {
+        val credit = api.plugin(accountKey, "/billing/meter/claim-compensation", "POST", JSONObject()).optLong("credit", 0)
+        if (credit != 0L) {
+            NativeCore.recordCredit(api.appContextCompat(), accountKey, "compensation", credit.toDouble(), "活动补偿")
+        }
+        return credit
+    }
 }

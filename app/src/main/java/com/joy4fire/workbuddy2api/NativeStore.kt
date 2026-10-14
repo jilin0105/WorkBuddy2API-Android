@@ -116,6 +116,24 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
             app_name TEXT NOT NULL DEFAULT ''
         )""")
         db.execSQL("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        // 积分账本：记录每一笔积分的来去。
+        //
+        // 为什么需要本地记账：上游【没有】积分流水接口（已核对 1.2.7 的全部
+        // billing/meter 端点，只有 get-user-resource 这类"当前快照"）。
+        // 因此"每日签到得了多少、奖励得了多少、调用消耗了多少"只能由客户端
+        // 在每次动作发生时自己记下来，否则用户永远只能看到一个总额，
+        // 无法区分积分来源。
+        //
+        // amount 约定：正数为获得，负数为消耗。
+        db.execSQL("""CREATE TABLE IF NOT EXISTS credit_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_key TEXT NOT NULL,
+            ts REAL NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'other',
+            amount REAL NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT ''
+        )""")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_ledger_account_ts ON credit_ledger(account_key, ts)")
         db.execSQL("""CREATE TABLE IF NOT EXISTS model_cache (
             cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'dynamic',
             fetched_at REAL NOT NULL, expires_at REAL NOT NULL
@@ -284,6 +302,95 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
     fun setCheckinDate(accountKey: String, date: String): Boolean = updateAccount(accountKey, ContentValues().apply {
         put("last_checkin_date", date); put("updated_at", nowSeconds())
     })
+
+    // ---------------------------------------------------------------- 积分账本
+
+    /**
+     * 记一笔积分变动。
+     *
+     * 只在【确定知道数额】时才记：上游接口没返回数值（如签到未返回任何积分字段）
+     * 就不写记录，避免把"未知"记成 0 —— 那会让账本看起来"有这笔但没收益"，
+     * 反而误导。宁可少记，不可错记。
+     *
+     * @param amount 正数=获得，负数=消耗；为 0 时不记账
+     */
+    fun recordCredit(accountKey: String, kind: String, amount: Double, note: String = ""): Boolean {
+        if (accountKey.isBlank() || amount == 0.0 || !amount.isFinite()) return false
+        return writableDatabase.insert("credit_ledger", null, ContentValues().apply {
+            put("account_key", accountKey); put("ts", nowSeconds())
+            put("kind", kind); put("amount", amount); put("note", note)
+        }) != -1L
+    }
+
+    /** 某账号的积分明细（倒序，最新在前）。 */
+    fun creditLedger(accountKey: String, limit: Int = 200): JSONArray = synchronized(lock) {
+        val out = JSONArray()
+        readableDatabase.rawQuery(
+            "SELECT id,ts,kind,amount,note FROM credit_ledger WHERE account_key=? ORDER BY ts DESC, id DESC LIMIT ?",
+            arrayOf(accountKey, limit.coerceIn(1, 1000).toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.put(JSONObject()
+                    .put("id", c.getLong(0)).put("ts", c.getDouble(1))
+                    .put("kind", c.getString(2)).put("amount", c.getDouble(3))
+                    .put("note", c.getString(4)))
+            }
+        }
+        out
+    }
+
+    /**
+     * 按类别汇总某账号的积分：今日与累计两档。
+     *
+     * 分成 today / total 是因为用户最关心的是"今天签到拿了多少"，
+     * 而累计值用于看长期收益。
+     */
+    fun creditLedgerSummary(accountKey: String): JSONObject = synchronized(lock) {
+        val todayStart = todayStartSeconds()
+        val kinds = JSONObject()
+        var todayGain = 0.0; var todayLoss = 0.0
+        var totalGain = 0.0; var totalLoss = 0.0
+        readableDatabase.rawQuery(
+            "SELECT kind, SUM(CASE WHEN ts>=? THEN amount ELSE 0 END), SUM(amount), " +
+                "SUM(CASE WHEN ts>=? AND amount>0 THEN amount ELSE 0 END), " +
+                "SUM(CASE WHEN ts>=? AND amount<0 THEN -amount ELSE 0 END), " +
+                "SUM(CASE WHEN amount>0 THEN amount ELSE 0 END), SUM(CASE WHEN amount<0 THEN -amount ELSE 0 END) " +
+                "FROM credit_ledger WHERE account_key=? GROUP BY kind",
+            arrayOf(todayStart.toString(), todayStart.toString(), todayStart.toString(), accountKey)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val kind = c.getString(0)
+                val todayNet = c.getDouble(1); val totalNet = c.getDouble(2)
+                val todayGainK = c.getDouble(3); val todayLossK = c.getDouble(4)
+                val totalGainK = c.getDouble(5); val totalLossK = c.getDouble(6)
+                kinds.put(kind, JSONObject()
+                    .put("today", todayNet).put("today_gain", todayGainK).put("today_loss", todayLossK)
+                    .put("total", totalNet).put("total_gain", totalGainK).put("total_loss", totalLossK))
+                todayGain += todayGainK; todayLoss += todayLossK
+                totalGain += totalGainK; totalLoss += totalLossK
+            }
+        }
+        JSONObject()
+            .put("account_key", accountKey)
+            .put("today_gain", todayGain).put("today_loss", todayLoss)
+            .put("total_gain", totalGain).put("total_loss", totalLoss)
+            .put("kinds", kinds)
+    }
+
+    /** 本地时区的今日 0 点（秒）。用本地时区而非 UTC：用户说的"今天"是手机上的今天。 */
+    private fun todayStartSeconds(): Long {
+        val cal = java.util.Calendar.getInstance()
+        cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        cal.set(java.util.Calendar.MINUTE, 0)
+        cal.set(java.util.Calendar.SECOND, 0)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        return cal.timeInMillis / 1000
+    }
+
+    /** 清空某账号的积分账本（数据管理用）。 */
+    fun clearCreditLedger(accountKey: String): Int = synchronized(lock) {
+        writableDatabase.delete("credit_ledger", "account_key=?", arrayOf(accountKey))
+    }
 
     private fun updateAccount(accountKey: String, values: ContentValues): Boolean = synchronized(lock) {
         val (region, uid) = splitAccountKey(accountKey)
@@ -747,7 +854,15 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
 
     companion object {
         private const val DATABASE_NAME = "workbuddy-native.db"
-        private const val DATABASE_VERSION = 8
+        /**
+         * 数据库版本。
+         *
+         * 注意：新增【表】时必须提升此版本号 —— onCreate 只在全新安装时执行，
+         * 老库不会重新走它；只有版本号变大，SQLite 才会调用 onUpgrade，
+         * 进而执行 createSchema 里的 CREATE TABLE IF NOT EXISTS 把新表补上。
+         * v9：新增 credit_ledger（积分账本，用于区分签到/奖励/消耗）。
+         */
+        private const val DATABASE_VERSION = 9
         private const val KEY_ALIAS = "workbuddy_native_app_keys"
         /** 优先级下限：0 = 不额外加权（选号权重 = 1.0）。 */
         const val MIN_PRIORITY = 0

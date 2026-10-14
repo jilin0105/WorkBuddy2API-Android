@@ -345,7 +345,22 @@ class ApiHostService : Service() {
                 val upstream = NativeCore.upstreamRequest(this, chatBody, region)
                 account = upstream.account
                 call = NativeCore.http.newCall(upstream.request)
-                response = call.execute()
+                // 网络层异常单独兜一层：连接被重置/DNS 抖动/复用到死连接时，
+                // call.execute() 会直接抛 IOException，绕开下面的 HTTP 状态判断，
+                // 于是整个请求就地失败——这是"上游经常断开"最直接的来源。
+                // 处理方式与 HTTP 可重试状态一致：冷却当前账号、换一个健康账号重试一次。
+                response = try {
+                    call.execute()
+                } catch (e: IOException) {
+                    NativeCore.store(this).markAccountFailure(account.key, NativeCore.cooldownFor(503))
+                    if (attempt == 0 && !socket.isClosed) {
+                        attempt++
+                        val healthy = NativeCore.store(this).countHealthy(region.id)
+                        Log.w(TAG, "network error on ${account.uid} (${e.message}); retrying with another account (healthy=$healthy)")
+                        if (healthy >= 1) continue
+                    }
+                    throw e
+                }
                 if (response.isSuccessful) break
 
                 val raw = response.body?.string().orEmpty()
@@ -532,16 +547,23 @@ class ApiHostService : Service() {
     ) {
         val inputTokens = usage?.optLong("prompt_tokens", usage.optLong("input_tokens", 0)) ?: 0L
         val outputTokens = usage?.optLong("completion_tokens", usage.optLong("output_tokens", 0)) ?: 0L
+        val credits = upstreamCredits(usage)
         val record = JSONObject().put("protocol", protocol.wireName).put("model", model).put("status", status)
             .put("error", error).put("latency_ms", System.currentTimeMillis() - startedAt)
             .put("input_content", input).put("output_content", output).put("reasoning_content", reasoning)
             .put("input_tokens", inputTokens).put("output_tokens", outputTokens)
             .put("total_tokens", usage?.optLong("total_tokens", inputTokens + outputTokens) ?: inputTokens + outputTokens)
-            .put("credits", upstreamCredits(usage))
+            .put("credits", credits)
             .put("ts", System.currentTimeMillis() / 1000.0)
             .put("account_uid", account?.uid ?: "")
             .put("account_region", account?.region?.id ?: app.optString("region").ifBlank { "domestic" })
             .put("app_name", app.optString("name"))
+        // 把消耗记入积分账本（负数），与签到/奖励的所得分列，
+        // 这样"积分详情"里能看到完整的收支两条线，而不只是总额。
+        // 只在拿到确定的消耗额（>0）且归属到具体账号时才记。
+        if (credits > 0 && account != null) {
+            runCatching { NativeCore.recordCredit(this, account.key, "consume", -credits, model) }
+        }
         // 原始 usage 一并打点：真机核对上游积分字段名时只需看 logcat，不必改代码重编。
         if (usage != null) Log.i(TAG, "upstream usage=$usage")
         Log.i(TAG, "usage=$record")

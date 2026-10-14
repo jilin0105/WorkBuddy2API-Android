@@ -348,6 +348,19 @@ class AppState(private val context: Context) {
 
     // ---------------------------------------------------------------- 记录 / 应用 / 设置
 
+    /**
+     * 读取某账号的积分详情（上游实时余额 + 资源包 + 本地账本）。
+     * 在 IO 线程执行，避免阻塞界面；上游失败时内部已降级为本地缓存值，不会抛异常。
+     */
+    fun loadCreditDetail(accountKey: String): JSONObject =
+        runCatching { NativeCore.creditDetail(context, accountKey) }
+            .getOrElse { JSONObject().put("account_key", accountKey).put("refresh_error", it.message ?: "读取失败") }
+
+    fun clearCreditLedger(accountKey: String) = task("清空积分账本") {
+        val removed = NativeCore.clearCreditLedger(context, accountKey)
+        "已清空 $removed 条积分记录"
+    }
+
     fun deleteUsage(id: Long) = task("删除记录 #$id") {
         loadUsage()
         if (NativeCore.deleteUsage(context, id)) "已删除记录 #$id" else "这条记录已不存在"

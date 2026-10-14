@@ -58,6 +58,11 @@ fun AccountsScreen(context: Context, app: AppState) {
     var pendingExportName by remember { mutableStateOf("workbuddy-accounts.json") }
     var showExportResult by remember { mutableStateOf<String?>(null) }
     var importError by remember { mutableStateOf<String?>(null) }
+    // 积分详情弹窗：按账号单独查看积分来源（签到/奖励/消耗）
+    var showCreditDetail by remember { mutableStateOf(false) }
+    var creditAccountKey by remember { mutableStateOf("") }
+    var creditAccountName by remember { mutableStateOf("") }
+    var creditDetail by remember { mutableStateOf<org.json.JSONObject?>(null) }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val target = uri ?: return@rememberLauncherForActivityResult
@@ -169,12 +174,22 @@ fun AccountsScreen(context: Context, app: AppState) {
                     onExport = {
                         scope.launch {
                             val payload = withContext(Dispatchers.IO) { app.exportAccount(accountKey) }
-                            if (payload.isNullOrBlank()) showExportResult = "该账号没有可导出的认证数据"
-                            else {
+                            if (payload.isNullOrBlank()) {
+                                showExportResult = "该账号没有可导出的认证数据"
+                            } else {
                                 pendingExport = payload
                                 pendingExportName = "workbuddy-${FormatKit.safeFileName(nickname.ifBlank { uid })}.json"
                                 exportLauncher.launch(pendingExportName)
                             }
+                        }
+                    },
+                    onShowCredits = {
+                        creditAccountKey = accountKey
+                        creditAccountName = nickname
+                        creditDetail = null           // 先置空，弹窗内显示"读取中"
+                        showCreditDetail = true
+                        scope.launch {
+                            creditDetail = withContext(Dispatchers.IO) { app.loadCreditDetail(accountKey) }
                         }
                     }
                 )
@@ -295,6 +310,27 @@ fun AccountsScreen(context: Context, app: AppState) {
         message = showExportResult.orEmpty(),
         onDismiss = { showExportResult = null }
     )
+
+    // 积分详情弹窗：按账号查看积分来源（签到/奖励）与去向（消耗）
+    if (showCreditDetail) {
+        CreditDetailDialog(
+            accountName = creditAccountName,
+            detail = creditDetail,
+            onRefresh = {
+                creditDetail = null
+                scope.launch {
+                    creditDetail = withContext(Dispatchers.IO) { app.loadCreditDetail(creditAccountKey) }
+                }
+            },
+            onClearLedger = {
+                app.clearCreditLedger(creditAccountKey)
+                scope.launch {
+                    creditDetail = withContext(Dispatchers.IO) { app.loadCreditDetail(creditAccountKey) }
+                }
+            },
+            onDismiss = { showCreditDetail = false }
+        )
+    }
 }
 
 /** 单个账号卡片：状态、额度、签到、优先级、启停、导出、删除。 */
@@ -304,7 +340,8 @@ private fun AccountCard(
     accountKey: String,
     nickname: String,
     app: AppState,
-    onExport: () -> Unit
+    onExport: () -> Unit,
+    onShowCredits: () -> Unit
 ) {
     val uid = account.optString("uid")
     val enabled = account.optBoolean("enabled", true)
@@ -348,10 +385,11 @@ private fun AccountCard(
             )
             Spacer(Modifier.height(PcTokens.SpaceM))
             // 统一走 PcActionGrid：等宽、按钮间有固定间距、奇数个自动折行且不拉伸。
-            // 此前四个按钮分两个 Row 手工摆放，导致三个挤成一排、删除单独换行且宽度不一致。
+            // 「积分详情」放首位并作为主按钮：按账号核对积分来源是高频需求。
             PcActionGrid(
                 actions = listOf(
-                    PcAction(if (enabled) "停用" else "启用", primary = true) {
+                    PcAction("积分详情", primary = true) { onShowCredits() },
+                    PcAction(if (enabled) "停用" else "启用") {
                         app.setAccountEnabled(accountKey, !enabled)
                     },
                     PcAction("优先级") { showPriority = true },

@@ -2,6 +2,7 @@ package com.joy4fire.workbuddy2api
 
 import android.content.Context
 import android.util.Log
+import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -25,7 +26,21 @@ object NativeCore {
     private val JSON = "application/json; charset=utf-8".toMediaType()
     val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS).readTimeout(300, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS).build()
+        .writeTimeout(60, TimeUnit.SECONDS)
+        // ---- 连接稳定性（针对"经常断开"的调优）----
+        // 1) 失败自动重试：覆盖连接被重置/复用陈旧 keep-alive 连接这类
+        //    瞬时故障。此前为默认值，移动网络切换（Wi-Fi↔蜂窝）时很容易直接失败。
+        .retryOnConnectionFailure(true)
+        // 2) 保活探测：每 30 秒发一次 ping，及时回收已被对端关闭的死连接。
+        //    不设它的话，连接池里可能长期留着"看起来活着、实际已断"的连接，
+        //    下次请求复用它就会立刻失败——这正是"经常断开"的典型成因。
+        .pingInterval(30, TimeUnit.SECONDS)
+        // 3) 连接池调大并延长保活：默认只有 5 个空闲连接 / 5 分钟，
+        //    本项目会并发访问 copilot.tencent.com 与 www.workbuddy.cn 两个域，
+        //    池子太小会导致频繁重建连接（每次都要完整 TLS 握手）。
+        .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
+        // 4) 显式协议与密码套件交给平台默认即可，不锁定，避免旧设备握手失败。
+        .build()
 
     /**
      * 进程内模型目录缓存。请求路径（GET /v1/models）只读它，绝不发起网络请求——
@@ -569,6 +584,12 @@ object NativeCore {
         val total = after?.optDouble("total")
         val gained = if (before != null && remaining != null) remaining - before else null
 
+        // 记入积分账本：只有确实算出增量时才记（gained 为 null 表示缺少快照，不写假数据）。
+        // 增量为 0 也不写 —— 账本里只应有真实发生的变动。
+        if (gained != null && gained != 0.0) {
+            store(context).recordCredit(account.key, "checkin", gained, if (already) "补记签到变动" else "每日签到")
+        }
+
         return JSONObject()
             .put("uid", account.uid).put("account_key", account.key)
             .put("region", account.region.id).put("region_label", account.region.label)
@@ -904,17 +925,105 @@ object NativeCore {
     fun settings(context: Context): JSONObject = store(context).getSettings()
     fun saveSettings(context: Context, values: JSONObject): JSONObject = store(context).saveSettings(values)
 
+    // ---------------------------------------------------------------- 积分详情
+
+    /** 记一笔积分变动（正=获得，负=消耗）。 */
+    fun recordCredit(context: Context, accountKey: String, kind: String, amount: Double, note: String = ""): Boolean =
+        store(context).recordCredit(accountKey, kind, amount, note)
+
+    /** 清空某账号积分账本。 */
+    fun clearCreditLedger(context: Context, accountKey: String): Int = store(context).clearCreditLedger(accountKey)
+
+    /**
+     * 某账号的完整积分详情。
+     *
+     * 由三部分拼成，缺一不可：
+     *   ① 上游实时余额与资源包（fetchCredits）—— 真实剩余与到期时间，
+     *      并按资源包拆开，能看到额度由哪几笔发放构成；
+     *   ② 本地账本汇总（creditLedgerSummary）—— 区分签到/奖励/消耗，
+     *      因为上游没有流水接口，这部分只能靠本地记账；
+     *   ③ 本地账本明细（creditLedger）—— 逐笔记录，供核对。
+     *
+     * 上游刷新失败时不抛异常，而是带上 refresh_error 字段继续返回本地数据 ——
+     * 用户关心的是"我的积分去哪了"，网络不通不应该让整个页面打不开。
+     */
+    fun creditDetail(context: Context, accountKey: String, ledgerLimit: Int = 200): JSONObject {
+        val account = loadAccount(context, accountKey)
+        val result = JSONObject().put("account_key", accountKey)
+        result.put("nickname", account?.nickname ?: "")
+        result.put("uid", account?.uid ?: "")
+        result.put("region_label", account?.region?.label ?: "")
+
+        // ① 上游实时
+        val fresh = runCatching { fetchCredits(context, account ?: throw IOException("账号不存在")) }
+        fresh.onSuccess { r ->
+            result.put("remaining", r.optDouble("remain", 0.0))
+            result.put("total", r.optDouble("total", 0.0))
+            result.put("expire_at", r.opt("expire_at") ?: JSONObject.NULL)
+            result.put("packages", r.optJSONArray("packages") ?: JSONArray())
+        }.onFailure { e ->
+            result.put("refresh_error", e.message ?: "刷新失败")
+            // 退回本地缓存值，保证页面仍可打开
+            val cached = loadAccount(context, accountKey)
+            result.put("remaining", cached?.root?.optDouble("credits_remaining", 0.0) ?: 0.0)
+            result.put("total", cached?.root?.optDouble("credits_total", 0.0) ?: 0.0)
+            result.put("expire_at", cached?.root?.opt("credits_expire_at") ?: JSONObject.NULL)
+            result.put("packages", runCatching {
+                JSONArray(cached?.root?.optString("credit_packages_json").orEmpty())
+            }.getOrDefault(JSONArray()))
+        }
+
+        // ②③ 本地账本
+        result.put("ledger_summary", store(context).creditLedgerSummary(accountKey))
+        result.put("ledger", store(context).creditLedger(accountKey, ledgerLimit))
+        result.put("last_checkin_date", account?.root?.optString("last_checkin_date").orEmpty())
+        return result
+    }
+
     fun request(url: String, method: String, body: JSONObject?, headers: Map<String, String>): Request {
         val builder = Request.Builder().url(url); headers.forEach { (k, v) -> if (v.isNotEmpty()) builder.header(k, v) }
         return if (method.equals("GET", true)) builder.get().build() else builder.method(method.uppercase(Locale.US), (body ?: JSONObject()).toString().toRequestBody(JSON)).build()
     }
 
+    /**
+     * 执行一次性（非流式）请求并解析 JSON。
+     *
+     * 内置重试，针对移动网络下的瞬时故障（连接被重置、DNS 抖动、
+     * 复用到已关闭的 keep-alive 连接等）。这些故障重发一次通常就成功，
+     * 而此前是一次失败就抛给上层，用户看到的就是"上游经常断开"。
+     *
+     * 为什么可以安全重试：本方法只用于非流式请求（流式响应走 body.source()，
+     * 不经过这里）。因此整个响应体在内存中，重试不会导致半截数据或重复消费。
+     * 对 GET/查询类天然幂等；对 POST 类，上游接口在其自身的幂等/状态判定下
+     * （如签到返回 already、领奖返回 already_claimed）也能安全重放。
+     *
+     * 重试策略：最多 2 次额外尝试，退避 400ms / 1200ms。仅重试网络层异常，
+     * HTTP 状态码错误不重试 —— 那是业务结果，重发没有意义。
+     */
     fun executeJson(request: Request, allowHttpError: Boolean = false): JSONObject {
-        http.newCall(request).execute().use { response ->
-            val text = response.body?.string().orEmpty()
-            if (!allowHttpError && !response.isSuccessful) throw IOException("HTTP ${response.code}: ${text.take(240)}")
-            return runCatching { JSONObject(text) }.getOrElse { throw IOException("服务器返回非 JSON：${text.take(160)}") }
+        var lastError: Exception? = null
+        val delays = longArrayOf(400L, 1200L)
+        for (attempt in 0..delays.size) {
+            try {
+                http.newCall(request).execute().use { response ->
+                    val text = response.body?.string().orEmpty()
+                    if (!allowHttpError && !response.isSuccessful) {
+                        throw IOException("HTTP ${response.code}: ${text.take(240)}")
+                    }
+                    return runCatching { JSONObject(text) }
+                        .getOrElse { throw IOException("服务器返回非 JSON：${text.take(160)}") }
+                }
+            } catch (e: IOException) {
+                // HTTP 错误是我们自己抛的 IOException，用前缀区分，不参与重试
+                if (e.message?.startsWith("HTTP ") == true || e.message?.startsWith("服务器返回非 JSON") == true) throw e
+                lastError = e
+                if (attempt < delays.size) {
+                    Log.w(TAG, "request failed (attempt ${attempt + 1}), retrying in ${delays[attempt]}ms: ${e.message}")
+                    runCatching { Thread.sleep(delays[attempt]) }
+                }
+            }
         }
+        throw lastError ?: IOException("请求失败")
     }
 
     private fun currentAccount(context: Context): Account {
