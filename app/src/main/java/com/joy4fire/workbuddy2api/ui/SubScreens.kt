@@ -174,7 +174,9 @@ fun InspectorScreen(context: Context, app: AppState) {
     var showAll by remember { mutableStateOf(false) }
     var detailIndex by remember { mutableStateOf<Int?>(null) }
     val entries = remember(app.revision) { app.inspectorEntries() }
-    val enabled = app.inspectorEnabled()
+    // 与设置页同理：isEnabled 每次重组都读 SharedPreferences，
+    // 虽比 canDrawOverlays 轻，但没有理由每帧读一次。
+    val enabled = remember(app.revision) { app.inspectorEnabled() }
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),

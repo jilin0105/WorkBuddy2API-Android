@@ -54,11 +54,27 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
     val vendorText = remember { KeepAliveGuide.vendorLabel() }
     val t3 = remember { System.currentTimeMillis() }
 
+    // ---- 以下三处此前在每次重组（每一帧）都执行系统调用，是设置页卡顿的主因 ----
+    //
+    // ① RequestInspector.count() → 读 SharedPreferences 字符串 + JSONArray 解析
+    // ② FloatingWindowKeeper.isEnabled() → 读 SharedPreferences
+    // ③ FloatingWindowKeeper.hasPermission() → Settings.canDrawOverlays()
+    //    ⚠️ 这是跨进程 IPC，每帧都向 system_server 查询一次权限
+    //
+    // 它们的结果在页面停留期间不会自行变化（只有用户点开关才会变），
+    // 因此用 remember 缓存；开关操作后由 app.setFloating 的 bump() 触发外层重组，
+    // 届时 key 变化会重新取值 —— 既省掉每帧开销，又不丢状态更新。
+    val floatingEnabled = remember(app.revision) { app.floatingEnabled() }
+    val floatingPermitted = remember(app.revision) { app.floatingPermitted() }
+    val inspectorOn = remember(app.revision) { app.inspectorEnabled() }
+    val inspectorCount = remember(app.revision) { app.inspectorCount() }
+    val t4 = remember { System.currentTimeMillis() }
+
     androidx.compose.runtime.LaunchedEffect(Unit) {
         android.util.Log.i("WbPerf",
             "Settings 分段耗时：进入块=${t1 - perfTag}ms，" +
                 "installedVersion=${t2 - t1}ms，vendorLabel=${t3 - t2}ms，" +
-                "组合完成=${System.currentTimeMillis() - t3}ms；" +
+                "状态查询=${t4 - t3}ms，组合完成=${System.currentTimeMillis() - t4}ms；" +
                 "settings键数=${settings.length()} accounts=${app.accounts.length()}")
     }
 
@@ -134,7 +150,7 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                 )
                 ArrowPreference(
                     title = "出网取证",
-                    summary = if (app.inspectorEnabled()) "已开启 · 当前 ${app.inspectorCount()} 条" else "已关闭 · 用于与官方 CLI 比对",
+                    summary = if (inspectorOn) "已开启 · 当前 $inspectorCount 条" else "已关闭 · 用于与官方 CLI 比对",
                     onClick = { onOpenSub(SubPage.INSPECTOR) }
                 )
                 // 三个清理动作统一走 PcActionGrid：等宽、有间距、自动折行。
@@ -157,12 +173,20 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                 SwitchPreference(
                     title = "悬浮球保活（可选）",
                     summary = "屏幕上显示服务状态球。可见窗口能提升进程优先级，但挡不住「一键清理」。",
-                    checked = app.floatingEnabled(),
+                    checked = floatingEnabled,
                     onCheckedChange = { app.setFloating(it, activity) }
                 )
                 Spacer(Modifier.height(PcTokens.SpaceS / 2))
                 Text(
-                    app.floatingStateText(),
+                    // 不再调用 floatingStateText()：它内部会再次执行
+                    // isEnabled + hasPermission（后者是跨进程 IPC），
+                    // 直接用上面已缓存的两个布尔值拼装，避免重复系统调用。
+                    when {
+                        !floatingEnabled -> "未启用。启用后需授予「显示在其他应用上层」权限。"
+                        !floatingPermitted -> "已开启但缺少悬浮窗权限，请重新开关一次以授权。"
+                        !app.serviceRunning -> "已开启且权限就绪；服务启动后会显示悬浮球。"
+                        else -> "运行中：悬浮球已显示，进程处于可见状态。"
+                    },
                     style = MiuixTheme.textStyles.body2,
                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary
                 )
