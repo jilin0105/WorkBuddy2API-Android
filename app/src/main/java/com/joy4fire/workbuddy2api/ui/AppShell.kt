@@ -38,18 +38,24 @@ import top.yukonga.miuix.kmp.icon.extended.Tasks
  * 由所在页面内以 [SubPage] 状态切换，返回按钮在顶栏 —— 层级只有两级，
  * 引 Navigation 组件的成本（返回栈同步、依赖体积）大于收益。
  */
+/**
+ * 一级 Tab（底部导航）。
+ *
+ * 「记录」已从一级 Tab 迁入设置页的二级页面 —— 7 个 Tab 在 1440px 宽的屏幕上
+ * 每个只剩约 200px，图标+文字被挤得很挤；而「记录」属于低频查阅项，
+ * 放进设置更合理，底部也宽松了。
+ */
 enum class AppTab(val label: String) {
     OVERVIEW("概览"),
     ACCOUNTS("账号"),
     MODELS("模型"),
-    RECORDS("记录"),
     APPS("应用"),
     SETTINGS("设置"),
     GROWTH("成长")
 }
 
 /** 二级页面（覆盖在 Tab 之上，带返回按钮）。 */
-enum class SubPage { NONE, USAGE, INSPECTOR, STORAGE, KEEPALIVE, PROMPT }
+enum class SubPage { NONE, USAGE, INSPECTOR, STORAGE, KEEPALIVE, PROMPT, RECORDS }
 
 @Composable
 fun AppShell(context: Context, app: AppState) {
@@ -84,6 +90,7 @@ fun AppShell(context: Context, app: AppState) {
                     SubPage.STORAGE -> "存储占用"
                     SubPage.KEEPALIVE -> "后台保活"
                     SubPage.PROMPT -> "提示词注入"
+                    SubPage.RECORDS -> "调用记录"
                     SubPage.NONE -> tab.label
                 }
                 SmallTopAppBar(
@@ -125,12 +132,6 @@ fun AppShell(context: Context, app: AppState) {
                             label = "模型"
                         )
                         NavigationBarItem(
-                            selected = tab == AppTab.RECORDS,
-                            onClick = { tab = AppTab.RECORDS },
-                            icon = MiuixIcons.ListView,
-                            label = "记录"
-                        )
-                        NavigationBarItem(
                             selected = tab == AppTab.APPS,
                             onClick = { tab = AppTab.APPS },
                             icon = MiuixIcons.GridView,
@@ -160,6 +161,7 @@ fun AppShell(context: Context, app: AppState) {
                         SubPage.STORAGE -> StorageScreen(context, app)
                         SubPage.KEEPALIVE -> KeepAliveScreen(context, app)
                         SubPage.PROMPT -> PromptScreen(context)
+                        SubPage.RECORDS -> RecordsScreen(context, app)
                         SubPage.NONE -> Unit
                     }
                 } else {
@@ -167,7 +169,6 @@ fun AppShell(context: Context, app: AppState) {
                         AppTab.OVERVIEW -> OverviewScreen(context, app) { sub = it }
                         AppTab.ACCOUNTS -> AccountsScreen(context, app)
                         AppTab.MODELS -> ModelsScreen(context, app)
-                        AppTab.RECORDS -> RecordsScreen(context, app)
                         AppTab.APPS -> AppsScreen(context, app)
                         AppTab.SETTINGS -> SettingsScreen(context, app) { sub = it }
                         AppTab.GROWTH -> GrowthScreen(context, app.selectedAccount)

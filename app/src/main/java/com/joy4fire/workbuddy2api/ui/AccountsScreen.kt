@@ -251,7 +251,14 @@ fun AccountsScreen(context: Context, app: AppState) {
                 item { SmallTitle(text = "最近签到结果") }
                 items(results.length()) { index ->
                     val result = results.optJSONObject(index) ?: return@items
+                    // 状态文案要区分三种"没签到"的原因，否则用户无法判断
+                    // 是"该做的都做了"还是"有问题"：
+                    //   · 国际版         → 本来就没有签到这个动作
+                    //   · 账号已停用     → 用户自己关的
+                    //   · 今日已签到     → 正常，已签过
                     val status = when {
+                        !result.optBoolean("checkin_supported", true) && result.optBoolean("skipped") ->
+                            if (result.optBoolean("ok")) "国际版不适用" else "国际版刷新失败"
                         result.optBoolean("skipped") -> "已跳过"
                         result.optBoolean("already") -> "今日已签到"
                         result.optBoolean("ok") -> "签到成功"

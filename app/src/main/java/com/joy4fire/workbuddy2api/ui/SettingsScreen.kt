@@ -107,6 +107,13 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
 
         item {
             PcCard(title = "数据管理") {
+                // 「调用记录」从底部 Tab 迁到这里：它是低频查阅项，
+                // 放在设置里能让底部导航从 7 个精简到 6 个。
+                ArrowPreference(
+                    title = "调用记录",
+                    summary = "查看每次请求的模型、扣费账号、Tokens 与积分消耗",
+                    onClick = { onOpenSub(SubPage.RECORDS) }
+                )
                 ArrowPreference(
                     title = "存储占用",
                     summary = "数据库体积、目录占用与清理",

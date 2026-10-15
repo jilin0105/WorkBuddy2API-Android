@@ -664,9 +664,36 @@ object NativeCore {
                 continue
             }
             if (AccountRegion.from(item.optString("region")) == AccountRegion.INTERNATIONAL) {
-                results.put(JSONObject().put("uid", uid).put("account_key", accountKey).put("region", item.optString("region")).put("region_label", item.optString("region_label")).put("nickname", nickname).put("ok", false)
-                    .put("skipped", true).put("checkin_supported", false)
-                    .put("message", "国际版额度自动发放，不参与签到"))
+                // 国际版没有"签到"这个动作（额度由上游自动发放），但此前是硬跳过，
+                // 结果是用户点了「一键签到」后只看到"已跳过"，不知道额度到底多少。
+                // 改为顺手刷新一次额度：这样至少能在结果里确认它的当前状态，
+                // 与「额度自动发放」的语义一致，也不浪费这次点击。
+                val refreshed = runCatching { refreshCredits(context, accountKey) }
+                results.put(
+                    refreshed.fold(
+                        onSuccess = { r ->
+                            JSONObject()
+                                .put("uid", uid).put("account_key", accountKey)
+                                .put("region", item.optString("region"))
+                                .put("region_label", item.optString("region_label"))
+                                .put("nickname", nickname)
+                                .put("ok", true).put("skipped", true).put("checkin_supported", false)
+                                .put("credits_remaining", r.optDouble("remain"))
+                                .put("credits_total", r.optDouble("total"))
+                                .put("message", "国际版无签到概念（额度自动发放），已刷新额度：剩余 %.1f / 总计 %.1f"
+                                    .format(r.optDouble("remain"), r.optDouble("total")))
+                        },
+                        onFailure = { e ->
+                            JSONObject()
+                                .put("uid", uid).put("account_key", accountKey)
+                                .put("region", item.optString("region"))
+                                .put("region_label", item.optString("region_label"))
+                                .put("nickname", nickname)
+                                .put("ok", false).put("skipped", true).put("checkin_supported", false)
+                                .put("message", "国际版无签到概念；刷新额度失败：${e.message ?: "未知错误"}")
+                        }
+                    )
+                )
                 continue
             }
             runCatching { checkIn(context, accountKey) }
