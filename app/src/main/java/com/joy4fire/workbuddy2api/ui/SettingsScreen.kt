@@ -41,15 +41,26 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  */
 @Composable
 fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit) {
+    // 临时性能埋点：定位"点击设置要 3 秒才响应"的真实耗时点。
+    // 用 remember 包住，只在进入页面时打一次，不干扰每帧。
+    val perfTag = remember { System.currentTimeMillis() }
+
     val settings = app.settings
     val activity = LocalContext.current as? Activity
 
-    // 版本号只查一次。
-    //
-    // 为什么必须缓存：installedVersion 内部调用 PackageManager.getPackageInfo，
-    // 是跨进程的同步 IPC。此前它直接写在 LazyColumn 的 item 里，等于每次重组
-    // （包括每一帧滚动）都要向系统包管理器查一次 —— 这是设置页卡顿的主因之一。
+    val t1 = remember { System.currentTimeMillis() }
     val versionText = remember(context) { installedVersion(context) }
+    val t2 = remember { System.currentTimeMillis() }
+    val vendorText = remember { KeepAliveGuide.vendorLabel() }
+    val t3 = remember { System.currentTimeMillis() }
+
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        android.util.Log.i("WbPerf",
+            "Settings 分段耗时：进入块=${t1 - perfTag}ms，" +
+                "installedVersion=${t2 - t1}ms，vendorLabel=${t3 - t2}ms，" +
+                "组合完成=${System.currentTimeMillis() - t3}ms；" +
+                "settings键数=${settings.length()} accounts=${app.accounts.length()}")
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -64,23 +75,23 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                     checked = settings.optString("keepalive_enabled", "1") in setOf("1", "true"),
                     onCheckedChange = { app.saveSetting("keepalive_enabled", if (it) "1" else "0") }
                 )
-                SettingField(
+                SettingRow(
                     label = "每日签到时段",
                     value = settings.optString("checkin_hours", "9,21"),
                     hint = "24 小时制，逗号分隔，例如 9,21",
                     onCommit = { app.saveSetting("checkin_hours", it) }
                 )
-                SettingField(
+                SettingRow(
                     label = "额度刷新间隔（分钟）",
                     value = settings.optString("credit_refresh_min", "30"),
                     onCommit = { app.saveSetting("credit_refresh_min", it) }
                 )
-                SettingField(
+                SettingRow(
                     label = "模型缓存（分钟）",
                     value = settings.optString("model_ttl_min", "60"),
                     onCommit = { app.saveSetting("model_ttl_min", it) }
                 )
-                SettingField(
+                SettingRow(
                     label = "使用记录保留天数",
                     value = settings.optString("usage_retention_days", "30"),
                     hint = "控制数据体积最有效的一项",
@@ -152,7 +163,7 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
         }
 
         item {
-            PcCard(title = "后台保活 · ${KeepAliveGuide.vendorLabel()}") {
+            PcCard(title = "后台保活 · $vendorText") {
                 SwitchPreference(
                     title = "悬浮球保活（可选）",
                     summary = "屏幕上显示服务状态球。可见窗口能提升进程优先级，但挡不住「一键清理」。",
@@ -215,59 +226,6 @@ private fun AppState.floatingStateText(): String {    val enabled = floatingEnab
         !permitted -> "已开启但缺少悬浮窗权限，请重新开关一次以授权。"
         !ApiHostService.running -> "已开启且权限就绪；服务启动后会显示悬浮球。"
         else -> "运行中：悬浮球已显示，进程处于可见状态。"
-    }
-}
-
-/**
- * 设置项输入框。
- *
- * 【为什么不用 remember(label, value)】
- *   旧写法 `var text by remember(label, value) { mutableStateOf(value) }` 有个致命问题：
- *   value 来自 app.settings，而每次保存后 loadSettings() 会替换整个 JSONObject，
- *   value 随之变化 → remember 的 key 变化 → TextField 被整体重建 →
- *   光标丢失、正在输入的内容被重置，表现为"输入卡顿/打字丢字"。
- *   现在改为只在首次进入时用 value 初始化（key 只取 label），
- *   之后完全由本地状态驱动，外部数据变化不再打断输入。
- *
- * 【保存时机】失去焦点，而不是每次按键 —— 这类值是数字/时段串，
- *   边输边存会把 "3" 这样的中间态写进库，后台任务会读到非法配置。
- */
-@Composable
-private fun SettingField(
-    label: String,
-    value: String,
-    hint: String? = null,
-    onCommit: (String) -> Unit
-) {
-    // key 只用 label：同一字段在整个页面存活期内保持同一个 TextField 实例
-    var text by remember(label) { mutableStateOf(value) }
-    var lastCommitted by remember(label) { mutableStateOf(value) }
-    // 外部值变化（例如点了"还原默认"）时同步进来，但要避免覆盖用户正在编辑的内容：
-    // 仅当用户当前输入与上次提交值一致（即没有未保存改动）才接受外部更新。
-    if (value != lastCommitted && text == lastCommitted) {
-        text = value
-        lastCommitted = value
-    }
-    Column(Modifier.fillMaxWidth().height(84.dp)) {
-        TextField(
-            value = text,
-            onValueChange = { text = it },
-            label = label,
-            modifier = Modifier.fillMaxWidth()
-        )
-        if (hint != null) {
-            Text(hint, style = MiuixTheme.textStyles.body2,
-                color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-        }
-        if (text != lastCommitted) {
-            TextButton(
-                text = "保存 $label",
-                onClick = {
-                    lastCommitted = text
-                    onCommit(text)
-                }
-            )
-        }
     }
 }
 
