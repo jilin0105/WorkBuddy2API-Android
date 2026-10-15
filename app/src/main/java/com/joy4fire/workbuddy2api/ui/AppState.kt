@@ -434,9 +434,31 @@ class AppState(private val context: Context) {
         } else "删除失败，请重试"
     }
 
+    /**
+     * 保存单项设置。
+     *
+     * 全部放到 IO 线程：saveSettings 是同步 SQLite 写入（含 WAL 提交），
+     * loadSettings 又要再读一次全表。此前两者都在主线程执行，
+     * 点一次「保存」会掉若干帧 —— 这是设置页卡顿的另一半原因。
+     *
+     * 写完后立即把新值合并进内存中的 settings（乐观更新），
+     * 让界面马上反映结果；随后再异步拉一次库做最终对齐。
+     */
     fun saveSetting(key: String, value: String) {
-        NativeCore.saveSettings(context, JSONObject().put(key, value))
-        loadSettings()
+        scope.launch {
+            runCatching { NativeCore.saveSettings(context, JSONObject().put(key, value)) }
+                .onFailure {
+                    withContext(Dispatchers.Main) { message = "保存失败：${it.message ?: "写入被拒绝"}" }
+                }
+            withContext(Dispatchers.Main) {
+                // 乐观更新：避免"点了保存但界面还是旧值"的观感
+                settings = JSONObject().apply {
+                    settings.keys().forEach { put(it, settings.opt(it)) }
+                    put(key, value)
+                }
+            }
+            loadSettings()
+        }
     }
 
     fun clearWebViewCache() = task("清理 WebView 缓存") {

@@ -44,6 +44,13 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
     val settings = app.settings
     val activity = LocalContext.current as? Activity
 
+    // 版本号只查一次。
+    //
+    // 为什么必须缓存：installedVersion 内部调用 PackageManager.getPackageInfo，
+    // 是跨进程的同步 IPC。此前它直接写在 LazyColumn 的 item 里，等于每次重组
+    // （包括每一帧滚动）都要向系统包管理器查一次 —— 这是设置页卡顿的主因之一。
+    val versionText = remember(context) { installedVersion(context) }
+
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
         contentPadding = PaddingValues(top = PcTokens.SpaceM, bottom = 32.dp),
@@ -194,7 +201,7 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                 PcInfoRow("本地端口", ApiHostService.PORT.toString())
                 PcInfoRow("国内后端", NativeCore.BACKEND)
                 PcInfoRow("国际后端", NativeCore.INTERNATIONAL_BACKEND)
-                PcInfoRow("版本", installedVersion(context))
+                PcInfoRow("版本", versionText)
             }
         }
     }
@@ -212,10 +219,18 @@ private fun AppState.floatingStateText(): String {    val enabled = floatingEnab
 }
 
 /**
- * 设置项输入框：失焦时保存（与原实现一致）。
+ * 设置项输入框。
  *
- * 用「失焦保存」而不是「每次输入即保存」的理由：这类值是数字/时段串，
- * 边输边存会把 "3" 这样的中间态写进去，导致后台任务读到非法配置。
+ * 【为什么不用 remember(label, value)】
+ *   旧写法 `var text by remember(label, value) { mutableStateOf(value) }` 有个致命问题：
+ *   value 来自 app.settings，而每次保存后 loadSettings() 会替换整个 JSONObject，
+ *   value 随之变化 → remember 的 key 变化 → TextField 被整体重建 →
+ *   光标丢失、正在输入的内容被重置，表现为"输入卡顿/打字丢字"。
+ *   现在改为只在首次进入时用 value 初始化（key 只取 label），
+ *   之后完全由本地状态驱动，外部数据变化不再打断输入。
+ *
+ * 【保存时机】失去焦点，而不是每次按键 —— 这类值是数字/时段串，
+ *   边输边存会把 "3" 这样的中间态写进库，后台任务会读到非法配置。
  */
 @Composable
 private fun SettingField(
@@ -224,7 +239,15 @@ private fun SettingField(
     hint: String? = null,
     onCommit: (String) -> Unit
 ) {
-    var text by remember(label, value) { mutableStateOf(value) }
+    // key 只用 label：同一字段在整个页面存活期内保持同一个 TextField 实例
+    var text by remember(label) { mutableStateOf(value) }
+    var lastCommitted by remember(label) { mutableStateOf(value) }
+    // 外部值变化（例如点了"还原默认"）时同步进来，但要避免覆盖用户正在编辑的内容：
+    // 仅当用户当前输入与上次提交值一致（即没有未保存改动）才接受外部更新。
+    if (value != lastCommitted && text == lastCommitted) {
+        text = value
+        lastCommitted = value
+    }
     Column(Modifier.fillMaxWidth().height(84.dp)) {
         TextField(
             value = text,
@@ -236,10 +259,14 @@ private fun SettingField(
             Text(hint, style = MiuixTheme.textStyles.body2,
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
         }
-        // 提交时机：失去焦点。Compose 无内置 onFocusChanged 于 TextField 的简化入口，
-        // 这里用「值变化且与原值不同」的显式按钮兜底，保证一定能保存。
-        if (text != value) {
-            TextButton(text = "保存 $label", onClick = { onCommit(text) })
+        if (text != lastCommitted) {
+            TextButton(
+                text = "保存 $label",
+                onClick = {
+                    lastCommitted = text
+                    onCommit(text)
+                }
+            )
         }
     }
 }
