@@ -204,7 +204,18 @@ fun GrowthScreen(context: Context, accountKey: String?) {
                 }
                 if (logs.isNotEmpty()) {
                     Spacer(Modifier.height(PcTokens.SpaceS))
-                    logs.takeLast(12).forEach { line ->
+                    // 积分汇总单独高亮置顶：这是用户最关心的结果（"到底加了多少分"），
+                    // 埋在几十行执行日志里不容易看到。
+                    val creditLine = logs.firstOrNull { it.contains("积分汇总") }
+                    if (creditLine != null) {
+                        Text(
+                            creditLine.substringAfter('：'),
+                            style = MiuixTheme.textStyles.main,
+                            color = MiuixTheme.colorScheme.primary
+                        )
+                        Spacer(Modifier.height(PcTokens.SpaceS / 2))
+                    }
+                    logs.filterNot { it.contains("积分汇总") }.takeLast(14).forEach { line ->
                         Text(line, style = MiuixTheme.textStyles.body2,
                             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             maxLines = 2, overflow = TextOverflow.Ellipsis)

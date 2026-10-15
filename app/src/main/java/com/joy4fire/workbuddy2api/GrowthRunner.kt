@@ -90,6 +90,15 @@ class GrowthRunner(
         val results = JSONArray()
         val snapshot = tasks.list(accountKey)
 
+        // 执行前记下积分余额。
+        // 为什么需要它：上游的任务列表【不返回奖励数额】（字段实测只有
+        // task_id/code/title/description/level_name/status/url），领奖接口也可能
+        // 不给 credit。此时唯一能算出"这次到底加了多少分"的办法，
+        // 就是对比本次执行前后的余额差额 —— 这也是 1.2.7 处理签到积分的同一思路。
+        val creditsBefore = runCatching {
+            NativeCore.refreshCredits(api.appContextCompat(), accountKey).optDouble("remain")
+        }.getOrNull()
+
         // ① 批量接受：只接受「未领取、未锁定、且尚未 accepted/completed」的任务
         val pending = snapshot.filter { !it.claimed && !it.locked && !it.accepted }.map { it.code }
         if (pending.isNotEmpty()) {
@@ -119,13 +128,24 @@ class GrowthRunner(
             }
             blocks.report("${task.code}…")
             val outcome = runCatching { entry.second(accountKey) }
+            val execMessage = outcome.getOrElse { it.message ?: "执行失败" }
             results.put(
-                outcome.fold(
-                    onSuccess = { result(task.code, "done", it) },
-                    onFailure = { result(task.code, "error", it.message ?: "执行失败") }
-                )
+                if (outcome.isSuccess) result(task.code, "done", execMessage)
+                else result(task.code, "error", execMessage)
             )
             api.sleep(1050)
+
+            // 执行成功后立刻尝试领奖，并把到账数额写进同一条结果。
+            // 这样用户看到的「已完成」会直接带上 +N 积分，
+            // 而不是要等到最后的统一领奖阶段（甚至等不到，因为那一步依赖重新拉列表）。
+            if (outcome.isSuccess) {
+                val claimed = runCatching { tasks.claimDetailed(accountKey, task.code) }.getOrNull()
+                if (claimed != null && !claimed.alreadyClaimed) {
+                    results.put(result(task.code, "claimed", "领奖：${claimed.describe()}"))
+                } else if (claimed != null) {
+                    results.put(result(task.code, "skipped", "领奖：${claimed.describe()}"))
+                }
+            }
         }
 
         // ③ 领奖阶段：执行完的行为可能有任务已达标，这里统一尝试领一次
@@ -143,6 +163,29 @@ class GrowthRunner(
         if (unmapped > 0) {
             blocks.report("有 $unmapped 个上游任务尚未适配")
         }
+
+        // 汇总本次执行的积分变化。
+        // 用余额差额而不是累加各任务的 reward 字段：上游任务列表里没有该字段，
+        // 领奖接口也可能不返回数额，只有差额是"确实到账了多少"的唯一可靠证据。
+        val creditsAfter = runCatching {
+            NativeCore.refreshCredits(api.appContextCompat(), accountKey).optDouble("remain")
+        }.getOrNull()
+        if (creditsBefore != null && creditsAfter != null) {
+            val delta = creditsAfter - creditsBefore
+            val text = when {
+                delta > 0 -> "本次执行共增加 %.1f 积分（%.1f → %.1f）".format(delta, creditsBefore, creditsAfter)
+                delta == 0.0 -> "本次执行未增加积分（当前剩余 %.1f）。任务可能按上游规则稍后计分，或需要对应的真实交互。".format(creditsAfter)
+                else -> "本次余额减少 %.1f（%.1f → %.1f），通常是期间的调用消耗，不是任务扣分。".format(-delta, creditsBefore, creditsAfter)
+            }
+            results.put(result("(积分汇总)", if (delta > 0) "done" else "skipped", text))
+            // 差额同步记入积分账本，让「积分详情」里也能看到这次任务的收益
+            if (delta != 0.0) {
+                runCatching { NativeCore.recordCredit(api.appContextCompat(), accountKey, "task", delta, "一键做任务") }
+            }
+        } else {
+            results.put(result("(积分汇总)", "skipped", "额度查询失败，无法计算本次积分变化；可稍后在账号页「积分详情」查看"))
+        }
+
         currentReporter = null
         return results
     }
