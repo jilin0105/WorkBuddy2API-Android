@@ -55,7 +55,7 @@ enum class AppTab(val label: String) {
 }
 
 /** 二级页面（覆盖在 Tab 之上，带返回按钮）。 */
-enum class SubPage { NONE, USAGE, INSPECTOR, STORAGE, KEEPALIVE, PROMPT, RECORDS }
+enum class SubPage { NONE, USAGE, INSPECTOR, STORAGE, KEEPALIVE, PROMPT, RECORDS, SCHEDULE }
 
 @Composable
 fun AppShell(context: Context, app: AppState) {
@@ -91,6 +91,7 @@ fun AppShell(context: Context, app: AppState) {
                     SubPage.KEEPALIVE -> "后台保活"
                     SubPage.PROMPT -> "提示词注入"
                     SubPage.RECORDS -> "调用记录"
+                    SubPage.SCHEDULE -> "定时参数"
                     SubPage.NONE -> tab.label
                 }
                 SmallTopAppBar(
@@ -165,6 +166,7 @@ fun AppShell(context: Context, app: AppState) {
                         SubPage.KEEPALIVE -> KeepAliveScreen(context, app)
                         SubPage.PROMPT -> PromptScreen(context)
                         SubPage.RECORDS -> RecordsScreen(context, app)
+                        SubPage.SCHEDULE -> ScheduleScreen(context, app)
                         SubPage.NONE -> Unit
                     }
                 } else {

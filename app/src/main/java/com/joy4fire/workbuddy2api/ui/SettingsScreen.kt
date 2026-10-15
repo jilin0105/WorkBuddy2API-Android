@@ -75,27 +75,17 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                     checked = settings.optString("keepalive_enabled", "1") in setOf("1", "true"),
                     onCheckedChange = { app.saveSetting("keepalive_enabled", if (it) "1" else "0") }
                 )
-                SettingRow(
-                    label = "每日签到时段",
-                    value = settings.optString("checkin_hours", "9,21"),
-                    hint = "24 小时制，逗号分隔，例如 9,21",
-                    onCommit = { app.saveSetting("checkin_hours", it) }
-                )
-                SettingRow(
-                    label = "额度刷新间隔（分钟）",
-                    value = settings.optString("credit_refresh_min", "30"),
-                    onCommit = { app.saveSetting("credit_refresh_min", it) }
-                )
-                SettingRow(
-                    label = "模型缓存（分钟）",
-                    value = settings.optString("model_ttl_min", "60"),
-                    onCommit = { app.saveSetting("model_ttl_min", it) }
-                )
-                SettingRow(
-                    label = "使用记录保留天数",
-                    value = settings.optString("usage_retention_days", "30"),
-                    hint = "控制数据体积最有效的一项",
-                    onCommit = { app.saveSetting("usage_retention_days", it) }
+                // 以下四项合并为一行入口，首屏不再铺开四行：
+                // 它们都是低频修改项（签到时段/刷新间隔/缓存时长/保留天数），
+                // 放在二级页后，设置页首屏的组件数从 7 项降到 3 项，
+                // 页面组合成本显著下降 —— 对高温降频的设备尤其重要。
+                ArrowPreference(
+                    title = "定时参数",
+                    summary = "签到时段 ${settings.optString("checkin_hours", "9,21")} · " +
+                        "额度刷新 ${settings.optString("credit_refresh_min", "30")} 分钟 · " +
+                        "模型缓存 ${settings.optString("model_ttl_min", "60")} 分钟 · " +
+                        "记录保留 ${settings.optString("usage_retention_days", "30")} 天",
+                    onClick = { onOpenSub(SubPage.SCHEDULE) }
                 )
                 Spacer(Modifier.height(PcTokens.SpaceS))
                 Row(horizontalArrangement = Arrangement.spacedBy(PcTokens.SpaceS)) {
