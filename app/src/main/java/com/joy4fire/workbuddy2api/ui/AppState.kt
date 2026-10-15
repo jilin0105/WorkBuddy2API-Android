@@ -139,12 +139,36 @@ class AppState(private val context: Context) {
     // ---------------------------------------------------------------- 加载
 
     /** 刷新所有页面依赖的数据（进入应用时调一次）。 */
+    /**
+     * 刷新页面依赖的数据。
+     *
+     * 【为什么把 loadUsage 从这里移走】
+     *   loadUsage 会连续执行三个重量级查询：
+     *     · usageSummary    —— 全表聚合
+     *     · usageRecent     —— 取 100 条记录（含正文字段）
+     *     · usageTimeseries —— 按小时分组聚合，表越大越慢
+     *   而 NativeStore 使用单把全局锁，这些查询与"读设置/读账号"互斥。
+     *   原先 refreshAll 在应用启动时就把它们全部发起，于是用户刚打开应用、
+     *   正准备点进某个页面时，主线程要读库就排在这批查询后面，
+     *   表现为"点击后画面停住约 3 秒才跳转"。
+     *
+     *   现在改为按需加载：记录页/用量页各自在进入时调 loadUsageIfStale()，
+     *   启动阶段只加载界面首屏真正需要的轻量数据。
+     */
     fun refreshAll() {
-        loadAccounts()
+        // 顺序有意为之：settings 放最前，且先于其它任何读库操作。
+        //
+        // NativeStore 用单把全局锁把 38 个方法串行化（即便已启用 WAL，
+        // 这个 synchronized(lock) 也把读写并发的好处抵消掉了）。
+        // 因此启动阶段的读库任务是排队执行的，谁排在前面谁先完成。
+        // 设置页依赖 settings —— 把它排到队首，用户点进设置时数据已在内存，
+        // 不必再排队等锁。
         loadSettings()
+        loadAccounts()
         loadApps()
-        loadUsage()
         loadModelsFromCache()
+        // 刻意不调 loadUsage()：它含全表聚合与按小时分组，属最重的查询，
+        // 交由记录页/用量页进入时按需触发。
     }
 
     fun loadAccounts() {
