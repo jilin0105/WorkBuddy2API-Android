@@ -710,7 +710,16 @@ class ApiHostService : Service() {
             runAutomaticCredits(settings)
             runAutomaticModels(settings)
             runAutomaticKeepalive(settings)
-            runAutomaticUsageCleanup(settings)
+            // ⚠️ 数据库清理【不放在这里】。
+            //
+            // 它内部要做三件重活：删记录（持锁）、扫数据库统计空闲页（持锁）、
+            // 遍历目录统计各目录体积（大量 stat 系统调用）。
+            // 全程占用 NativeStore 的全局 synchronized(lock) —— 而主线程读设置
+            // （settings / accounts）也走同一把锁。之前就出现过：
+            // 用户进入应用后 5 秒撞上本 tick，点「设置」时主线程一直等锁，
+            // 画面停在原页面约 3 秒才跳转，表现为"设置页卡顿"。
+            // 改为独立线程 + 每天最多一次，且不阻塞维护主流程。
+            scheduleUsageCleanup(settings)
             prewarmModels()
         }.onFailure { Log.w(TAG, "maintenance tick failed", it) }
     }
@@ -723,11 +732,35 @@ class ApiHostService : Service() {
      * 按 settings.usage_retention_days（默认 30 天）删除过期记录，并在确实删到东西时
      * VACUUM 回收文件空间（否则 SQLite 只标记空闲页，系统里看到的体积不会变小）。
      */
+    /**
+     * 把数据库清理排到独立线程延后执行。
+     *
+     * 为什么必须延后且独立：
+     *   cleanupUsage / storageInfo / storageBreakdown 都会申请 NativeStore 的全局锁，
+     *   而主线程读取设置与账号列表也走同一把锁。若在维护 tick 中同步执行，
+     *   用户此时点开任何需要读库的页面（典型是设置页，它要读 settings）都会被阻塞，
+     *   直到清理结束 —— 实测约 3 秒。
+     *
+     *   延后 30 秒再跑，是为了避开用户刚打开应用、最可能操作界面的那段时间窗口。
+     *   清理本身不是时效性任务，晚 30 秒没有任何影响。
+     */
+    private fun scheduleUsageCleanup(settings: JSONObject) {
+        val prefs = getSharedPreferences("native_service", MODE_PRIVATE)
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        if (prefs.getString("last_usage_cleanup", null) == today) return
+        // 先占位，避免 60 秒后的下一次 tick 重复排队
+        prefs.edit().putString("last_usage_cleanup", today).apply()
+        workers.execute {
+            runCatching { Thread.sleep(30_000) }
+            runCatching { runAutomaticUsageCleanup(settings) }
+                .onFailure { Log.w(TAG, "deferred usage cleanup failed", it) }
+        }
+    }
+
     private fun runAutomaticUsageCleanup(settings: JSONObject) {
         val days = settings.optString("usage_retention_days", "30").toIntOrNull()?.coerceIn(1, 3650) ?: 30
-        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-        val prefs = getSharedPreferences("native_service", MODE_PRIVATE)
-        if (prefs.getString("last_usage_cleanup", null) == today) return
+        // 日期判断已上移到 scheduleUsageCleanup（它负责"每天一次"的占位），
+        // 这里只做实际清理，避免两处判断产生不一致。
         runCatching {
             val removed = NativeCore.cleanupUsage(this, days)
             // VACUUM 会重写整个库并长时间持有数据库锁，期间新记录写入会被阻塞，
@@ -739,7 +772,6 @@ class ApiHostService : Service() {
                     Log.i(TAG, "usage vacuum scheduled, free=${free / 1024}KB")
                 }
             }
-            prefs.edit().putString("last_usage_cleanup", today).apply()
             Log.i(TAG, "usage cleanup done: removed=$removed retention=${days}d")
         }.onFailure { Log.w(TAG, "usage cleanup failed", it) }
         // WebView 磁盘缓存同样需要定期回收：登录页资源（JS/图片/字体）体量可观，
