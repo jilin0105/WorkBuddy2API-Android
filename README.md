@@ -1,7 +1,6 @@
 # WorkBuddy2API · Android 原生版
 
 [![Build APK](https://github.com/jilin0105/WorkBuddy2API-Android/actions/workflows/build.yml/badge.svg)](https://github.com/jilin0105/WorkBuddy2API-Android/actions/workflows/build.yml)
-[![Latest build](https://img.shields.io/github/v/release/jilin0105/WorkBuddy2API-Android?label=latest%20APK&color=blue)](https://github.com/jilin0105/WorkBuddy2API-Android/releases/tag/latest-build)
 
 > 把腾讯 **WorkBuddy / CodeBuddy** 的积分额度，变成手机本地一个标准的 **OpenAI / Anthropic 兼容 API**。
 > 纯原生 Android 实现（Kotlin），**无需 Python、无需 Docker、无需电脑**——装到手机上就能跑。
@@ -17,6 +16,10 @@
 - APK 使用 **debug 签名**（本仓库为本地自用工具，不发布应用商店）
 - 安装前请先卸载设备上的旧版本，或确认签名一致
 - 也可在 [Actions](https://github.com/jilin0105/WorkBuddy2API-Android/actions) 页面下载任意一次构建的产物（保留 14 天）
+
+> 说明：上方只保留 GitHub 自带的构建状态徽章。
+> 先前使用过第三方 shields.io 版本徽章，但该域名在部分网络环境下无法加载，
+> 会显示成"图片加载失败"，因此已移除 —— 最新版本请直接看上面的 Release 链接。
 
 ---
 
