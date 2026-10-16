@@ -197,6 +197,7 @@ class AppState(private val context: Context) {
 
     fun loadSettings() {
         scope.launch {
+            // 读设置是设置页的关键路径：若这里耗时以秒计，就是主线程等库锁的证据。
             val s = runCatching { NativeCore.settings(context) }.getOrDefault(JSONObject())
             withContext(Dispatchers.Main) { settings = s; bump() }
         }

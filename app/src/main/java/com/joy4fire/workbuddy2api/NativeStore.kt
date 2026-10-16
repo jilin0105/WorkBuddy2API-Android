@@ -180,7 +180,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         accountKey(region, uid)
     }
 
-    fun getAccount(accountKey: String): JSONObject? = synchronized(lock) {
+    fun getAccount(accountKey: String): JSONObject? = run {
         val (region, uid) = splitAccountKey(accountKey)
         readableDatabase.rawQuery("SELECT * FROM accounts WHERE region=? AND uid=?", arrayOf(region, uid)).use { c ->
             if (c.moveToFirst()) accountJson(c) else null
@@ -190,7 +190,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
     fun getAccountRoot(accountKey: String): JSONObject? = getAccount(accountKey)?.optString("auth_json")
         ?.takeIf { it.isNotBlank() }?.let { runCatching { JSONObject(it) }.getOrNull() }
 
-    fun listAccounts(): JSONArray = synchronized(lock) {
+    fun listAccounts(): JSONArray = run {
         val out = JSONArray()
         readableDatabase.rawQuery("SELECT * FROM accounts ORDER BY priority DESC,id ASC", null).use { c ->
             while (c.moveToNext()) out.put(accountJson(c).apply { remove("auth_json") })
@@ -236,7 +236,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
      * 换号重试前必须先冷却掉刚失败的账号再调用本方法，否则刚失败的号会被自己算进去，
      * 导致「以为还有健康号 → 换号 → 又选中它」的假重试。
      */
-    fun countHealthy(region: String? = null): Int = synchronized(lock) {
+    fun countHealthy(region: String? = null): Int = run {
         val now = nowSeconds()
         val regionClause = if (region.isNullOrBlank()) "" else " AND region=?"
         val regionArgs = if (region.isNullOrBlank()) null else arrayOf(region)
@@ -323,7 +323,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
     }
 
     /** 某账号的积分明细（倒序，最新在前）。 */
-    fun creditLedger(accountKey: String, limit: Int = 200): JSONArray = synchronized(lock) {
+    fun creditLedger(accountKey: String, limit: Int = 200): JSONArray = run {
         val out = JSONArray()
         readableDatabase.rawQuery(
             "SELECT id,ts,kind,amount,note FROM credit_ledger WHERE account_key=? ORDER BY ts DESC, id DESC LIMIT ?",
@@ -345,7 +345,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
      * 分成 today / total 是因为用户最关心的是"今天签到拿了多少"，
      * 而累计值用于看长期收益。
      */
-    fun creditLedgerSummary(accountKey: String): JSONObject = synchronized(lock) {
+    fun creditLedgerSummary(accountKey: String): JSONObject = run {
         val todayStart = todayStartSeconds()
         val kinds = JSONObject()
         var todayGain = 0.0; var todayLoss = 0.0
@@ -542,7 +542,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         JSONObject().put("id", id).put("name", "Default").put("key", legacyKey)
     }
 
-    fun listApps(): JSONArray = synchronized(lock) {
+    fun listApps(): JSONArray = run {
         val out = JSONArray()
         readableDatabase.rawQuery("""SELECT a.id,a.name,a.key_prefix,a.region,a.note,a.enabled,a.created_at,a.updated_at,
             COUNT(u.id) requests,COALESCE(SUM(u.total_tokens),0) tokens,COALESCE(SUM(u.credits),0) credits
@@ -552,7 +552,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         out
     }
 
-    fun getAppKey(appId: Long): String? = synchronized(lock) {
+    fun getAppKey(appId: Long): String? = run {
         readableDatabase.rawQuery("SELECT key_enc FROM apps WHERE id=?", arrayOf(appId.toString())).use { c ->
             if (!c.moveToFirst()) null else decrypt(c.getString(0)).ifBlank { null }
         }
@@ -606,7 +606,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         })
     }
 
-    fun usageSummary(): JSONObject = synchronized(lock) {
+    fun usageSummary(): JSONObject = run {
         val total = aggregate("SELECT COUNT(*) c,COALESCE(SUM(total_tokens),0) t FROM usage_logs")
         val today = aggregate("SELECT COUNT(*) c,COALESCE(SUM(total_tokens),0) t FROM usage_logs WHERE ts>=?", arrayOf(localMidnight().toString()))
         JSONObject().put("total_requests", total.first).put("total_tokens", total.second)
@@ -616,7 +616,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
     }
 
     fun usageRecent(page: Int = 1, pageSize: Int = 20, protocol: String? = null, model: String? = null,
-                    appName: String? = null, status: String? = null, light: Boolean = true): JSONObject = synchronized(lock) {
+                    appName: String? = null, status: String? = null, light: Boolean = true): JSONObject = run {
         val filter = usageFilter(protocol, model, appName, status)
         val size = pageSize.coerceIn(1, 500); val safePage = max(1, page)
         val count = readableDatabase.rawQuery("SELECT COUNT(*) FROM usage_logs ${filter.first}", filter.second.toTypedArray()).use { c -> c.moveToFirst(); c.getInt(0) }
@@ -629,11 +629,11 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         JSONObject().put("records", rows).put("total", count).put("page", safePage).put("page_size", size)
     }
 
-    fun getUsage(id: Long): JSONObject? = synchronized(lock) {
+    fun getUsage(id: Long): JSONObject? = run {
         readableDatabase.rawQuery("SELECT * FROM usage_logs WHERE id=?", arrayOf(id.toString())).use { c -> if (c.moveToFirst()) rowJson(c) else null }
     }
 
-    fun usageFilters(): JSONObject = synchronized(lock) {
+    fun usageFilters(): JSONObject = run {
         val currentApps = distinct("SELECT name FROM apps ORDER BY id")
         val usedApps = distinct("SELECT DISTINCT app_name FROM usage_logs WHERE app_name!='' ORDER BY app_name")
         val current = (0 until currentApps.length()).map { currentApps.getString(it) }.toSet()
@@ -645,7 +645,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
             .put("statuses", distinct("SELECT DISTINCT status FROM usage_logs WHERE status!='' ORDER BY status"))
     }
 
-    fun usageTimeseries(granularity: String = "hour", points: Int = 24, model: String? = null): JSONArray = synchronized(lock) {
+    fun usageTimeseries(granularity: String = "hour", points: Int = 24, model: String? = null): JSONArray = run {
         val day = granularity == "day"; val bucket = if (day) 86400L else 3600L
         val count = points.coerceIn(1, 1000); val now = nowSeconds().toLong()
         val end = if (day) localMidnight().toLong() else now - now % bucket
@@ -738,7 +738,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
 
     // Settings and model cache --------------------------------------------------
 
-    fun getSettings(): JSONObject = synchronized(lock) {
+    fun getSettings(): JSONObject = run {
         val out = JSONObject(DEFAULT_SETTINGS)
         readableDatabase.rawQuery("SELECT key,value FROM settings", null).use { c -> while (c.moveToNext()) out.put(c.getString(0), c.getString(1)) }
         out
@@ -764,7 +764,7 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         writableDatabase.delete("model_cache", "cache_key=?", arrayOf("models:$region"))
     }
 
-    fun getModelCache(allowExpired: Boolean = true, region: String = "domestic"): JSONObject? = synchronized(lock) {
+    fun getModelCache(allowExpired: Boolean = true, region: String = "domestic"): JSONObject? = run {
         readableDatabase.rawQuery("SELECT payload,source,fetched_at,expires_at FROM model_cache WHERE cache_key=?", arrayOf(modelCacheKey(region))).use { c ->
             if (!c.moveToFirst() || (!allowExpired && c.getDouble(3) < nowSeconds())) null else JSONObject()
                 .put("models", runCatching { JSONArray(c.getString(0)) }.getOrDefault(JSONArray()))

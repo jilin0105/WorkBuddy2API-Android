@@ -1,221 +1,99 @@
 package com.joy4fire.workbuddy2api.ui
 
-import android.app.Activity
 import android.content.Context
-import android.content.Intent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import com.joy4fire.workbuddy2api.ApiHostService
-import com.joy4fire.workbuddy2api.FormatKit
-import com.joy4fire.workbuddy2api.KeepAliveGuide
-import com.joy4fire.workbuddy2api.NativeCore
-import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.SmallTitle
+import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
-import top.yukonga.miuix.kmp.basic.TextField
-import top.yukonga.miuix.kmp.preference.ArrowPreference
-import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * 设置页 —— 对应原界面 settingsPage()。
+ * 设置页 —— 分组入口式布局（性能优先版）。
  *
- * 原页面是一个超长页面，包含：自动化任务配置、数据管理、出网取证、系统权限、保活引导。
- * 这里把四个重项（出网取证 / 存储占用 / 后台保活 / 提示词）提升为二级页面入口，
- * 主干只留开关与高频项 —— 因为原页面长度已超过 3 屏，用户很难找到想要的那一项。
+ * 【为什么改成分组入口】
+ *   实测埋点数据：本页「主线程读数据库」仅 1ms，而「渲染完成」要 2612ms。
+ *   卡顿与数据无关，全部来自组合/布局/绘制的组件开销。
+ *   因此唯一有效的解法是【减少首屏需要实例化的组件数量】。
+ *
+ *   原布局首屏要建：3 张卡片 + 1 个 SwitchPreference + 10 个 ArrowPreference
+ *   + 2 个 Button，约 16 个可交互组件，且 ArrowPreference 各自带图标与
+ *   交互状态订阅。现布局首屏只有 8 行纯文本入口 + 1 个开关，
+ *   其余全部下钻到二级页，由 LazyColumn 懒加载 —— 不在视口内的行不实例化。
  */
 @Composable
 fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit) {
-    // 临时性能埋点：定位"点击设置要 3 秒才响应"的真实耗时点。
-    // 用 remember 包住，只在进入页面时打一次，不干扰每帧。
-    val perfTag = remember { System.currentTimeMillis() }
-
-    val settings = app.settings
-    val activity = LocalContext.current as? Activity
-
-    val t1 = remember { System.currentTimeMillis() }
-    val versionText = remember(context) { installedVersion(context) }
-    val t2 = remember { System.currentTimeMillis() }
-    val vendorText = remember { KeepAliveGuide.vendorLabel() }
-    val t3 = remember { System.currentTimeMillis() }
-
-    // ---- 以下三处此前在每次重组（每一帧）都执行系统调用，是设置页卡顿的主因 ----
-    //
-    // ① RequestInspector.count() → 读 SharedPreferences 字符串 + JSONArray 解析
-    // ② FloatingWindowKeeper.isEnabled() → 读 SharedPreferences
-    // ③ FloatingWindowKeeper.hasPermission() → Settings.canDrawOverlays()
-    //    ⚠️ 这是跨进程 IPC，每帧都向 system_server 查询一次权限
-    //
-    // 它们的结果在页面停留期间不会自行变化（只有用户点开关才会变），
-    // 因此用 remember 缓存；开关操作后由 app.setFloating 的 bump() 触发外层重组，
-    // 届时 key 变化会重新取值 —— 既省掉每帧开销，又不丢状态更新。
-    val floatingEnabled = remember(app.revision) { app.floatingEnabled() }
-    val floatingPermitted = remember(app.revision) { app.floatingPermitted() }
-    val inspectorOn = remember(app.revision) { app.inspectorEnabled() }
-    val inspectorCount = remember(app.revision) { app.inspectorCount() }
-    val t4 = remember { System.currentTimeMillis() }
-
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        android.util.Log.i("WbPerf",
-            "Settings 分段耗时：进入块=${t1 - perfTag}ms，" +
-                "installedVersion=${t2 - t1}ms，vendorLabel=${t3 - t2}ms，" +
-                "状态查询=${t4 - t3}ms，组合完成=${System.currentTimeMillis() - t4}ms；" +
-                "settings键数=${settings.length()} accounts=${app.accounts.length()}")
-    }
-
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
         contentPadding = PaddingValues(top = PcTokens.SpaceM, bottom = 32.dp),
         verticalArrangement = Arrangement.spacedBy(PcTokens.CardGap)
     ) {
         item {
-            PcCard(title = "自动化任务") {
-                SwitchPreference(
+            PcCard(title = "常用") {
+                SwitchRow(
                     title = "启用账号保活",
                     summary = "定时刷新令牌与额度，保持账号可用",
-                    checked = settings.optString("keepalive_enabled", "1") in setOf("1", "true"),
-                    onCheckedChange = { app.saveSetting("keepalive_enabled", if (it) "1" else "0") }
+                    checked = app.settings.optString("keepalive_enabled", "1") in setOf("1", "true"),
+                    onChange = { app.saveSetting("keepalive_enabled", if (it) "1" else "0") }
                 )
-                // 以下四项合并为一行入口，首屏不再铺开四行：
-                // 它们都是低频修改项（签到时段/刷新间隔/缓存时长/保留天数），
-                // 放在二级页后，设置页首屏的组件数从 7 项降到 3 项，
-                // 页面组合成本显著下降 —— 对高温降频的设备尤其重要。
-                ArrowPreference(
-                    title = "定时参数",
-                    summary = "签到时段 ${settings.optString("checkin_hours", "9,21")} · " +
-                        "额度刷新 ${settings.optString("credit_refresh_min", "30")} 分钟 · " +
-                        "模型缓存 ${settings.optString("model_ttl_min", "60")} 分钟 · " +
-                        "记录保留 ${settings.optString("usage_retention_days", "30")} 天",
-                    onClick = { onOpenSub(SubPage.SCHEDULE) }
-                )
-                Spacer(Modifier.height(PcTokens.SpaceS))
-                Row(horizontalArrangement = Arrangement.spacedBy(PcTokens.SpaceS)) {
-                    TextButton(
-                        text = "立即刷新模型",
-                        onClick = { app.refreshModels() },
-                        modifier = Modifier.weight(1f)
-                    )
-                    TextButton(
-                        text = "立即刷新额度",
-                        onClick = { app.refreshCredits() },
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-            }
-        }
-
-        item {
-            PcCard(title = "提示词") {
-                ArrowPreference(
+                PcRow(
                     title = "提示词注入",
                     summary = "接管 system / 指纹清洗 / 降级开关",
+                    value = "›",
                     onClick = { onOpenSub(SubPage.PROMPT) }
                 )
             }
         }
 
         item {
-            PcCard(title = "数据管理") {
-                // 「调用记录」从底部 Tab 迁到这里：它是低频查阅项，
-                // 放在设置里能让底部导航从 7 个精简到 6 个。
-                ArrowPreference(
-                    title = "调用记录",
-                    summary = "查看每次请求的模型、扣费账号、Tokens 与积分消耗",
-                    onClick = { onOpenSub(SubPage.RECORDS) }
+            PcCard(title = "自动化") {
+                PcRow(
+                    title = "定时参数",
+                    summary = "签到时段 / 额度刷新 / 模型缓存 / 记录保留",
+                    value = "›",
+                    onClick = { onOpenSub(SubPage.SCHEDULE) }
                 )
-                ArrowPreference(
-                    title = "存储占用",
-                    summary = "数据库体积、目录占用与清理",
-                    onClick = { onOpenSub(SubPage.STORAGE) }
-                )
-                ArrowPreference(
-                    title = "用量统计",
-                    summary = "请求、Tokens 与额度概览",
-                    onClick = { onOpenSub(SubPage.USAGE) }
-                )
-                ArrowPreference(
-                    title = "出网取证",
-                    summary = if (inspectorOn) "已开启 · 当前 $inspectorCount 条" else "已关闭 · 用于与官方 CLI 比对",
-                    onClick = { onOpenSub(SubPage.INSPECTOR) }
-                )
-                // 三个清理动作统一走 PcActionGrid：等宽、有间距、自动折行。
-                // 此前是三个满宽按钮垂直相邻，会紧贴成一整块（"功能键融一块"）。
-                PcActionGrid(
-                    actions = listOf(
-                        PcAction("清理 WebView 缓存") { app.clearWebViewCache() },
-                        PcAction("截断超长记录内容") { app.trimUsage() },
-                        PcAction("清理过期记录") {
-                            val days = settings.optString("usage_retention_days", "30").toIntOrNull()?.coerceIn(1, 3650) ?: 30
-                            app.cleanupUsage(days)
-                        }
-                    )
-                )
-            }
-        }
-
-        item {
-            PcCard(title = "后台保活 · $vendorText") {
-                SwitchPreference(
-                    title = "悬浮球保活（可选）",
-                    summary = "屏幕上显示服务状态球。可见窗口能提升进程优先级，但挡不住「一键清理」。",
-                    checked = floatingEnabled,
-                    onCheckedChange = { app.setFloating(it, activity) }
-                )
-                Spacer(Modifier.height(PcTokens.SpaceS / 2))
-                Text(
-                    // 不再调用 floatingStateText()：它内部会再次执行
-                    // isEnabled + hasPermission（后者是跨进程 IPC），
-                    // 直接用上面已缓存的两个布尔值拼装，避免重复系统调用。
-                    when {
-                        !floatingEnabled -> "未启用。启用后需授予「显示在其他应用上层」权限。"
-                        !floatingPermitted -> "已开启但缺少悬浮窗权限，请重新开关一次以授权。"
-                        !app.serviceRunning -> "已开启且权限就绪；服务启动后会显示悬浮球。"
-                        else -> "运行中：悬浮球已显示，进程处于可见状态。"
-                    },
-                    style = MiuixTheme.textStyles.body2,
-                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                )
-                Spacer(Modifier.height(PcTokens.SpaceM))
-                ArrowPreference(
-                    title = "保活引导与状态检查",
-                    summary = "按厂商逐步放开后台限制，并检查是否还有漏项",
+                PcRow(
+                    title = "后台保活",
+                    summary = "按厂商逐步放开限制，并检查漏项",
+                    value = "›",
                     onClick = { onOpenSub(SubPage.KEEPALIVE) }
                 )
             }
         }
 
-        item { SmallTitle(text = "系统") }
         item {
-            PcCard {
-                ArrowPreference(
-                    title = "电池优化白名单",
-                    summary = "防后台冻结，其他软件随时可连",
-                    onClick = { KeepAliveGuide.requestIgnoreBattery(context) }
+            PcCard(title = "数据与诊断") {
+                PcRow(
+                    title = "调用记录",
+                    summary = "模型、扣费账号、Tokens 与积分消耗",
+                    value = "›",
+                    onClick = { onOpenSub(SubPage.RECORDS) }
                 )
-                ArrowPreference(
-                    title = "通知权限",
-                    summary = "前台服务运行状态",
-                    onClick = { KeepAliveGuide.openNotificationSettings(context) }
+                PcRow(
+                    title = "存储占用",
+                    summary = "数据库体积、目录占用与清理",
+                    value = "›",
+                    onClick = { onOpenSub(SubPage.STORAGE) }
                 )
-                ArrowPreference(
-                    title = "应用详情",
-                    summary = "电池、存储和权限",
-                    onClick = { KeepAliveGuide.openAppDetails(context) }
+                PcRow(
+                    title = "用量统计",
+                    summary = "请求、Tokens 与额度概览",
+                    value = "›",
+                    onClick = { onOpenSub(SubPage.USAGE) }
+                )
+                PcRow(
+                    title = "出网取证",
+                    summary = "与官方 CLI 逐字节比对的请求记录",
+                    value = "›",
+                    onClick = { onOpenSub(SubPage.INSPECTOR) }
                 )
             }
         }
@@ -223,36 +101,41 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
         item { SmallTitle(text = "关于") }
         item {
             PcCard {
-                PcInfoRow("本地端口", ApiHostService.PORT.toString())
-                PcInfoRow("国内后端", NativeCore.BACKEND)
-                PcInfoRow("国际后端", NativeCore.INTERNATIONAL_BACKEND)
-                PcInfoRow("版本", versionText)
+                PcInfoRow("版本", installedVersion(context))
+                PcInfoRow("本地端口", "8788")
             }
         }
     }
 }
 
-/** 悬浮球状态说明（把「开关」与「权限」分开说，否则用户会困惑于"开了却没效果"）。 */
-private fun AppState.floatingStateText(): String {    val enabled = floatingEnabled()
-    val permitted = floatingPermitted()
-    return when {
-        !enabled -> "未启用。启用后需授予「显示在其他应用上层」权限。"
-        !permitted -> "已开启但缺少悬浮窗权限，请重新开关一次以授权。"
-        !ApiHostService.running -> "已开启且权限就绪；服务启动后会显示悬浮球。"
-        else -> "运行中：悬浮球已显示，进程处于可见状态。"
+/** 轻量开关行：直接用 Switch，不经过 Preference 包装层。 */
+@Composable
+private fun SwitchRow(
+    title: String,
+    summary: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit
+) {
+    Column(Modifier.fillMaxWidth().padding(vertical = PcTokens.SpaceS / 2)) {
+        Text(title, style = MiuixTheme.textStyles.main)
+        Text(
+            summary,
+            style = MiuixTheme.textStyles.body2,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+        )
+        Switch(checked = checked, onCheckedChange = onChange)
     }
 }
 
 /**
  * 读取本机已安装的版本名。
  *
- * 为什么从 PackageManager 读而不是用 BuildConfig：
- *   本项目未开启 buildConfig 生成，且这样读到的就是【设备上实际运行的版本】——
- *   排查"是否装上了新版"时，这比读编译期常量更可信。
+ * 从 PackageManager 读而非 BuildConfig：本项目未开启 buildConfig 生成，
+ * 且这样得到的是【设备上实际运行的版本】—— 排查"是否装上新版"时更可信。
  */
 private fun installedVersion(context: Context): String = runCatching {
     val info = context.packageManager.getPackageInfo(context.packageName, 0)
-    // longVersionCode 需要 API 28+，minSdk 为 24，故低版本回退到 versionCode。
-    val code = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else @Suppress("DEPRECATION") info.versionCode.toLong()
+    val code = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode
+    else @Suppress("DEPRECATION") info.versionCode.toLong()
     "${info.versionName} ($code)"
 }.getOrDefault("未知")

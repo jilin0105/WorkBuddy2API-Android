@@ -140,10 +140,7 @@ fun AppShell(context: Context, app: AppState) {
                         )
                         NavigationBarItem(
                             selected = tab == AppTab.SETTINGS,
-                            onClick = {
-                                android.util.Log.i("WbPerf", "点击设置 Tab @${System.currentTimeMillis() % 100000}")
-                                tab = AppTab.SETTINGS
-                            },
+                            onClick = { tab = AppTab.SETTINGS },
                             icon = MiuixIcons.Settings,
                             label = "设置"
                         )
@@ -175,12 +172,7 @@ fun AppShell(context: Context, app: AppState) {
                         AppTab.ACCOUNTS -> AccountsScreen(context, app)
                         AppTab.MODELS -> ModelsScreen(context, app)
                         AppTab.APPS -> AppsScreen(context, app)
-                        AppTab.SETTINGS -> {
-                            // 埋点：记录"进入 SETTINGS 分支"的时刻，与点击时刻相减，
-                            // 就能区分延迟是发生在"切换前"还是"组合中"。
-                            android.util.Log.i("WbPerf", "进入 SETTINGS 分支 @${System.currentTimeMillis() % 100000}")
-                            SettingsScreen(context, app) { sub = it }
-                        }
+                        AppTab.SETTINGS -> SettingsScreen(context, app) { sub = it }
                         AppTab.GROWTH -> GrowthScreen(context, app.selectedAccount)
                     }
                 }
