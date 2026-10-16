@@ -6,44 +6,53 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.NavigationBar
 import top.yukonga.miuix.kmp.basic.NavigationBarItem
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.SmallTopAppBar
-import top.yukonga.miuix.kmp.basic.TextButton
+import top.yukonga.miuix.kmp.basic.Snackbar
+import top.yukonga.miuix.kmp.basic.SnackbarHost
+import top.yukonga.miuix.kmp.basic.SnackbarHostState
 import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.ContactsCircle
 import top.yukonga.miuix.kmp.icon.extended.Favorites
 import top.yukonga.miuix.kmp.icon.extended.GridView
 import top.yukonga.miuix.kmp.icon.extended.Layers
-import top.yukonga.miuix.kmp.icon.extended.ListView
 import top.yukonga.miuix.kmp.icon.extended.Settings
 import top.yukonga.miuix.kmp.icon.extended.Tasks
+import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
  * 应用外壳 —— 全 App 唯一的页面容器与导航。
  *
- * 页面结构（原「经典界面」的 8 个页面合并为 7 个一级 Tab）：
- *   概览 · 账号 · 模型 · 记录 · 应用 · 设置 · 成长
+ * 页面结构：6 个一级 Tab + 7 个二级页
+ *   一级：概览 · 账号 · 模型 · 应用 · 设置 · 成长
+ *   二级：用量统计 / 出网取证 / 存储占用 / 后台保活 / 提示词注入 / 调用记录 / 定时参数
  *
- * 「成长」为本次新增（移植自 WorkBuddy 1.2.7），其余六页承载原界面全部功能。
+ * 【为什么不引 Navigation 组件】
+ *   只有两级、二级页之间不做跳转，Navigation 的收益（返回栈同步、深链）在这里用不上，
+ *   代价却是多一个依赖 + 一处状态源不一致的风险。用两个枚举表达层级，
+ *   状态量少到可以完整推理。
  *
- * 二级页面（用量 / 出网取证 / 存储占用 / 后台保活 / 提示词注入）不入 Tab，
- * 由所在页面内以 [SubPage] 状态切换，返回按钮在顶栏 —— 层级只有两级，
- * 引 Navigation 组件的成本（返回栈同步、依赖体积）大于收益。
- */
-/**
- * 一级 Tab（底部导航）。
- *
- * 「记录」已从一级 Tab 迁入设置页的二级页面 —— 7 个 Tab 在 1440px 宽的屏幕上
- * 每个只剩约 200px，图标+文字被挤得很挤；而「记录」属于低频查阅项，
- * 放进设置更合理，底部也宽松了。
+ * 【两处关键修正（相对上一版）】
+ *   ① 二级页返回：上一版只在顶栏放了一个「返回」文字按钮，且固定回所属 Tab；
+ *      但同一个二级页可以从不同 Tab 进入（「用量统计」从概览和设置都能进），
+ *      于是会出现"返回回到了莫名其妙的地方"。现在用 [subOrigin] 记住来源，
+ *      返回键与顶栏返回都回到**来的那一页**。返回图标也改用 IconButton
+ *      （文字按钮会把标题挤偏，且图标按钮才符合"返回"的视觉约定）。
+ *   ② 瞬时提示：从「写进页面里的日志卡片」改到 Scaffold 级 Snackbar。
+ *      日志类内容（最近活动）保留为弹窗，不再占据页面版面。
  */
 enum class AppTab(val label: String) {
     OVERVIEW("概览"),
@@ -54,130 +63,154 @@ enum class AppTab(val label: String) {
     GROWTH("成长")
 }
 
-/** 二级页面（覆盖在 Tab 之上，带返回按钮）。 */
-enum class SubPage { NONE, USAGE, INSPECTOR, STORAGE, KEEPALIVE, PROMPT, RECORDS, SCHEDULE }
+/** 二级页面：覆盖在 Tab 之上，带返回键。 */
+enum class SubPage(val title: String) {
+    NONE(""),
+    USAGE("用量统计"),
+    INSPECTOR("出网取证"),
+    STORAGE("存储占用"),
+    KEEPALIVE("后台保活"),
+    PROMPT("提示词注入"),
+    RECORDS("调用记录"),
+    SCHEDULE("定时参数")
+}
 
 @Composable
 fun AppShell(context: Context, app: AppState) {
     var tab by rememberSaveable { mutableStateOf(AppTab.OVERVIEW) }
     var sub by rememberSaveable { mutableStateOf(SubPage.NONE) }
+    // 二级页的来源 Tab：返回时优先回它，而不是固定回某个"所属"Tab。
+    var subOrigin by rememberSaveable { mutableStateOf(AppTab.OVERVIEW) }
+
+    val openSub: (SubPage) -> Unit = { target ->
+        subOrigin = tab
+        sub = target
+    }
+    val goBack: () -> Unit = {
+        sub = SubPage.NONE
+        tab = subOrigin
+    }
 
     // 系统返回键（含全面屏手势）分级处理。
     //
     // 为什么必须显式处理：Compose 页面本身不消费返回事件，不注册就会直接传到
     // Activity 的默认实现（finish），表现为「在任何页面随手势返回都退出应用」。
-    // 这与 Android 用户的普遍预期不符，也让二级页几乎无法用单手返回。
     //
-    // 分级策略：
-    //   ① 二级页（用量/取证/存储/保活/提示词）→ 回所属一级 Tab
-    //   ② 非首页的一级 Tab → 回首页（概览）
-    //   ③ 首页且无二级页 → 不拦截，交给系统退出（此时退出才符合预期）
-    // 用 enabled 开关而不是在一个 handler 里分支：未启用的 handler 不参与返回栈，
-    // 系统能正确判定「无处可退」并执行退出。
-    BackHandler(enabled = sub != SubPage.NONE) { sub = SubPage.NONE }
+    // 分级：① 有二级页 → 关二级页；② 非概览 Tab → 回概览；③ 概览 → 交给系统退出。
+    // 用 enabled 开关而不是单 handler 内分支：未启用的 handler 不参与返回栈，
+    // 系统才能正确判定"无处可退"并执行退出。
+    BackHandler(enabled = sub != SubPage.NONE) { goBack() }
     BackHandler(enabled = sub == SubPage.NONE && tab != AppTab.OVERVIEW) { tab = AppTab.OVERVIEW }
 
-    // 提供 NavigationEventDispatcherOwner：Miuix 的对话框/弹层内部注册 NavigationBackHandler，
-    // 而 Compose Dialog 是独立 window、取不到宿主的 owner，不提供会直接崩（详见 NavCompat.kt）。
-    // 包裹整个 Scaffold：各页面的对话框都渲染在其子树内，一层即可覆盖全部弹层。
+    // 提供 NavigationEventDispatcherOwner：Miuix 的弹层/下拉/抽屉内部会注册
+    // NavigationBackHandler，而 Compose Dialog 是独立 window、View 树取不到宿主的
+    // owner，不提供就会崩（详见 NavCompat.kt）。包住整个 Scaffold 覆盖所有页面子树。
     ProvideNavigationEventDispatcher {
         AppTheme {
-        Scaffold(
-            topBar = {
-                val title = if (sub == SubPage.NONE) tab.label else when (sub) {
-                    SubPage.USAGE -> "用量"
-                    SubPage.INSPECTOR -> "出网取证"
-                    SubPage.STORAGE -> "存储占用"
-                    SubPage.KEEPALIVE -> "后台保活"
-                    SubPage.PROMPT -> "提示词注入"
-                    SubPage.RECORDS -> "调用记录"
-                    SubPage.SCHEDULE -> "定时参数"
-                    SubPage.NONE -> tab.label
+            val snackbarHostState = androidx.compose.runtime.remember { SnackbarHostState() }
+            val appContext = LocalContext.current
+
+            // AppState.message 是"一次性提示"：显示一次后立刻清空，
+            // 否则每次重组都会重新弹一遍。
+            val message = app.message
+            LaunchedEffect(message) {
+                if (!message.isNullOrBlank()) {
+                    snackbarHostState.showSnackbar(message)
+                    app.clearMessage()
                 }
-                SmallTopAppBar(
-                    title = title,
-                    navigationIcon = {
-                        if (sub != SubPage.NONE) {
-                            TextButton(
-                                text = "返回",
-                                onClick = { sub = SubPage.NONE },
-                                modifier = Modifier.padding(start = 8.dp)
+            }
+
+            Scaffold(
+                topBar = {
+                    val showBack = sub != SubPage.NONE
+                    SmallTopAppBar(
+                        title = if (showBack) sub.title else tab.label,
+                        navigationIcon = {
+                            if (showBack) {
+                                IconButton(onClick = goBack) {
+                                    // 用扩展图标集里语义正确的 Back，而不是拿 ArrowRight
+                                    // 旋转 180° 充数：miuix-icons 已在依赖里（本项目需要
+                                    // 它做底部导航的图标），所以没有理由再退而求其次。
+                                    Icon(
+                                        imageVector = MiuixIcons.Back,
+                                        contentDescription = "返回",
+                                        tint = MiuixTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        }
+                    )
+                },
+                bottomBar = {
+                    // 二级页隐藏底部导航：二级页是"深入"进来的，保留 Tab 会让用户
+                    // 以为还能横向切页；隐藏后焦点自然落在"看完返回"这一条路径上。
+                    if (sub == SubPage.NONE) {
+                        NavigationBar {
+                            NavigationBarItem(
+                                selected = tab == AppTab.OVERVIEW,
+                                onClick = { tab = AppTab.OVERVIEW },
+                                icon = MiuixIcons.Tasks,
+                                label = AppTab.OVERVIEW.label
+                            )
+                            NavigationBarItem(
+                                selected = tab == AppTab.ACCOUNTS,
+                                onClick = { tab = AppTab.ACCOUNTS },
+                                icon = MiuixIcons.ContactsCircle,
+                                label = AppTab.ACCOUNTS.label
+                            )
+                            NavigationBarItem(
+                                selected = tab == AppTab.MODELS,
+                                onClick = { tab = AppTab.MODELS },
+                                icon = MiuixIcons.Layers,
+                                label = AppTab.MODELS.label
+                            )
+                            NavigationBarItem(
+                                selected = tab == AppTab.APPS,
+                                onClick = { tab = AppTab.APPS },
+                                icon = MiuixIcons.GridView,
+                                label = AppTab.APPS.label
+                            )
+                            NavigationBarItem(
+                                selected = tab == AppTab.SETTINGS,
+                                onClick = { tab = AppTab.SETTINGS },
+                                icon = MiuixIcons.Settings,
+                                label = AppTab.SETTINGS.label
+                            )
+                            NavigationBarItem(
+                                selected = tab == AppTab.GROWTH,
+                                onClick = { tab = AppTab.GROWTH },
+                                icon = MiuixIcons.Favorites,
+                                label = AppTab.GROWTH.label
                             )
                         }
                     }
-                    // 不设全局「刷新」按钮：各页面自身已有更贴合语境的刷新入口
-                    // （概览的「刷新全部」、模型页的「刷新模型目录」、记录页的「刷新统计」、
-                    // 账号页的「刷新全部账号额度」）。顶栏再挂一个全局刷新，
-                    // 既与页面内按钮职责重叠，又会在每页重复出现，属冗余。
-                )
-            },
-            bottomBar = {
-                if (sub == SubPage.NONE) {
-                    NavigationBar {
-                        NavigationBarItem(
-                            selected = tab == AppTab.OVERVIEW,
-                            onClick = { tab = AppTab.OVERVIEW },
-                            icon = MiuixIcons.Tasks,
-                            label = "概览"
-                        )
-                        NavigationBarItem(
-                            selected = tab == AppTab.ACCOUNTS,
-                            onClick = { tab = AppTab.ACCOUNTS },
-                            icon = MiuixIcons.ContactsCircle,
-                            label = "账号"
-                        )
-                        NavigationBarItem(
-                            selected = tab == AppTab.MODELS,
-                            onClick = { tab = AppTab.MODELS },
-                            icon = MiuixIcons.Layers,
-                            label = "模型"
-                        )
-                        NavigationBarItem(
-                            selected = tab == AppTab.APPS,
-                            onClick = { tab = AppTab.APPS },
-                            icon = MiuixIcons.GridView,
-                            label = "应用"
-                        )
-                        NavigationBarItem(
-                            selected = tab == AppTab.SETTINGS,
-                            onClick = { tab = AppTab.SETTINGS },
-                            icon = MiuixIcons.Settings,
-                            label = "设置"
-                        )
-                        NavigationBarItem(
-                            selected = tab == AppTab.GROWTH,
-                            onClick = { tab = AppTab.GROWTH },
-                            icon = MiuixIcons.Favorites,
-                            label = "成长"
-                        )
+                },
+                snackbarHost = { SnackbarHost(state = snackbarHostState) { data -> Snackbar(data) } }
+            ) { padding ->
+                Box(Modifier.fillMaxSize().padding(padding)) {
+                    if (sub != SubPage.NONE) {
+                        when (sub) {
+                            SubPage.USAGE -> UsageScreen(appContext, app)
+                            SubPage.INSPECTOR -> InspectorScreen(appContext, app)
+                            SubPage.STORAGE -> StorageScreen(appContext, app)
+                            SubPage.KEEPALIVE -> KeepAliveScreen(appContext, app)
+                            SubPage.PROMPT -> PromptScreen(appContext)
+                            SubPage.RECORDS -> RecordsScreen(appContext, app)
+                            SubPage.SCHEDULE -> ScheduleScreen(appContext, app)
+                            SubPage.NONE -> Unit
+                        }
+                    } else {
+                        when (tab) {
+                            AppTab.OVERVIEW -> OverviewScreen(appContext, app, openSub)
+                            AppTab.ACCOUNTS -> AccountsScreen(appContext, app)
+                            AppTab.MODELS -> ModelsScreen(appContext, app)
+                            AppTab.APPS -> AppsScreen(appContext, app)
+                            AppTab.SETTINGS -> SettingsScreen(appContext, app, openSub)
+                            AppTab.GROWTH -> GrowthScreen(appContext, app)
+                        }
                     }
                 }
             }
-        ) { padding ->
-            Box(Modifier.fillMaxSize().padding(padding)) {
-                if (sub != SubPage.NONE) {
-                    when (sub) {
-                        SubPage.USAGE -> UsageScreen(context, app)
-                        SubPage.INSPECTOR -> InspectorScreen(context, app)
-                        SubPage.STORAGE -> StorageScreen(context, app)
-                        SubPage.KEEPALIVE -> KeepAliveScreen(context, app)
-                        SubPage.PROMPT -> PromptScreen(context)
-                        SubPage.RECORDS -> RecordsScreen(context, app)
-                        SubPage.SCHEDULE -> ScheduleScreen(context, app)
-                        SubPage.NONE -> Unit
-                    }
-                } else {
-                    when (tab) {
-                        AppTab.OVERVIEW -> OverviewScreen(context, app) { sub = it }
-                        AppTab.ACCOUNTS -> AccountsScreen(context, app)
-                        AppTab.MODELS -> ModelsScreen(context, app)
-                        AppTab.APPS -> AppsScreen(context, app)
-                        AppTab.SETTINGS -> SettingsScreen(context, app) { sub = it }
-                        AppTab.GROWTH -> GrowthScreen(context, app.selectedAccount)
-                    }
-                }
-            }
-        }
         }
     }
 }

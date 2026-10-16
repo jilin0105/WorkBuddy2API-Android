@@ -7,21 +7,21 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.joy4fire.workbuddy2api.AccountRegion
 import com.joy4fire.workbuddy2api.FormatKit
@@ -30,21 +30,27 @@ import com.joy4fire.workbuddy2api.OAuthWebActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import top.yukonga.miuix.kmp.basic.Button
-import top.yukonga.miuix.kmp.basic.Card
+import org.json.JSONArray
+import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.LinearProgressIndicator
-import top.yukonga.miuix.kmp.basic.SmallTitle
-import top.yukonga.miuix.kmp.basic.Slider
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * 账号页 —— 对应原界面 accountsPage()。
+ * 账号页 —— 账号池管理。
+ *
+ * 【重写要点】
+ *   ① 每个账号卡从「7 行键值 + 5 个按钮」压缩为「标题行 + 额度条 + 3 行关键信息 +
+ *      2 个按钮 + 一个"更多"」：账号卡是列表项，不是详情页。
+ *      高频动作（设为当前 / 刷新额度）留在卡上，低频动作（导出 / 优先级 / 删除）
+ *      收进「更多」弹窗 —— 这是上一版"每张卡五个等宽按钮、要滑两屏才看完一个号"的直接修正。
+ *   ② 额度用进度条 + 百分比表达，而不是一串数字：多账号场景下用户的第一诉求是
+ *      "哪个号快用完了"，条形比数字更快被扫读。
+ *   ③ 签到结果不再平铺成一列卡片，而是汇总成一句话 + 可展开的明细弹窗。
  *
  * 功能对齐清单（逐项对应原实现，一处未减）：
  *   国内版登录 / 国际版登录 / 切换账号登录 / 导入 auth 文件 / 导出全部账号
- *   单账号：启用停用、优先级、导出、删除
+ *   单账号：启用停用、优先级、导出、删除、积分详情
  *   批量：刷新全部额度、为全部国内账号签到
  *   展示：账号池、健康状态、额度、今日签到、签到结果
  */
@@ -53,16 +59,24 @@ fun AccountsScreen(context: Context, app: AppState) {
     val activity = LocalContext.current as? Activity
     val scope = rememberCoroutineScope()
 
-    // 导出目标由 SAF 选定后再写盘：pendingExport 保存待写内容，避免先写盘再让用户选位置。
+    // 导出目标由 SAF 选定后再写盘：pendingExport 保存待写内容，
+    // 避免"先写盘再让用户选位置"（那样用户取消后磁盘上已留下文件）。
     var pendingExport by remember { mutableStateOf<String?>(null) }
     var pendingExportName by remember { mutableStateOf("workbuddy-accounts.json") }
     var showExportResult by remember { mutableStateOf<String?>(null) }
     var importError by remember { mutableStateOf<String?>(null) }
-    // 积分详情弹窗：按账号单独查看积分来源（签到/奖励/消耗）
-    var showCreditDetail by remember { mutableStateOf(false) }
-    var creditAccountKey by remember { mutableStateOf("") }
+    // 积分详情弹窗：按账号查看积分来源（签到/奖励/消耗）
+    var creditAccountKey by remember { mutableStateOf<String?>(null) }
     var creditAccountName by remember { mutableStateOf("") }
-    var creditDetail by remember { mutableStateOf<org.json.JSONObject?>(null) }
+    var creditDetail by remember { mutableStateOf<JSONObject?>(null) }
+    // 单账号「更多」操作弹窗
+    var moreSheetAccount by remember { mutableStateOf<JSONObject?>(null) }
+    // 签到结果明细弹窗
+    var showCheckinDetail by remember { mutableStateOf(false) }
+
+    // 签到结果在 LazyList 内用于渲染汇总，在 LazyList 外用于明细弹窗，
+    // 因此提升到函数作用域一次读取（两处必须看到同一份数据）。
+    val results = app.checkinResults
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val target = uri ?: return@rememberLauncherForActivityResult
@@ -84,14 +98,17 @@ fun AccountsScreen(context: Context, app: AppState) {
         }
     }
 
-    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
         val payload = pendingExport
         pendingExport = null
         if (uri == null || payload.isNullOrBlank()) return@rememberLauncherForActivityResult
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    context.contentResolver.openOutputStream(uri, "wt")?.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+                    context.contentResolver.openOutputStream(uri, "wt")
+                        ?.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
                         ?: error("无法打开目标文件")
                 }
             }
@@ -102,12 +119,22 @@ fun AccountsScreen(context: Context, app: AppState) {
         }
     }
 
-    LazyColumn(
-        modifier = Modifier.fillMaxWidth(),
-        contentPadding = PaddingValues(top = PcTokens.SpaceM, bottom = 32.dp),
-        verticalArrangement = Arrangement.spacedBy(PcTokens.CardGap)
-    ) {
-        // ---------------- 登录与导入导出入 ----------------
+    /** 统一的单账号导出流程（卡片上的「导出」与「更多」里的「导出」共用）。 */
+    fun exportAccount(account: JSONObject, accountKey: String, nickname: String, uid: String) {
+        scope.launch {
+            val payload = withContext(Dispatchers.IO) { app.exportAccount(accountKey) }
+            if (payload.isNullOrBlank()) {
+                showExportResult = "该账号没有可导出的认证数据"
+            } else {
+                pendingExport = payload
+                pendingExportName = "workbuddy-${FormatKit.safeFileName(nickname.ifBlank { uid })}.json"
+                exportLauncher.launch(pendingExportName)
+            }
+        }
+    }
+
+    PcList {
+        // ---------------- 连接账号 ----------------
         item {
             PcCard(title = "连接账号") {
                 PcActionGrid(
@@ -124,72 +151,58 @@ fun AccountsScreen(context: Context, app: AppState) {
                                 app.showMessage("已清空登录态并打开登录窗口")
                             }
                         },
-                        PcAction("导入 auth 文件") { importLauncher.launch(arrayOf("application/json", "*/*")) },
-                        PcAction("导出全部账号") {
-                            scope.launch {
-                                val payload = withContext(Dispatchers.IO) { app.exportAllAccounts() }
-                                if (payload.isNullOrBlank()) {
-                                    showExportResult = "导出失败：没有可导出的认证数据"
-                                } else {
-                                    pendingExport = payload
-                                    pendingExportName = "workbuddy-accounts-${app.accounts.length()}.json"
-                                    exportLauncher.launch(pendingExportName)
-                                }
-                            }
-                        }
+                        PcAction("导入 auth 文件") { importLauncher.launch(arrayOf("application/json", "*/*")) }
                     )
                 )
-                Spacer(Modifier.height(PcTokens.SpaceS))
-                Text(
-                    "「切换账号登录」会先清空登录态，用于在同一设备上登录第二个账号；" +
-                        "导入支持 WorkBuddy / CodeBuddy 的 .info 与 JSON 认证文件。",
-                    style = MiuixTheme.textStyles.body2,
-                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+                Spacer(Modifier.height(PcTokens.RowGap))
+                PcWideButton(text = "导出全部账号", primary = false) {
+                    scope.launch {
+                        val payload = withContext(Dispatchers.IO) { app.exportAllAccounts() }
+                        if (payload.isNullOrBlank()) {
+                            showExportResult = "导出失败：没有可导出的认证数据"
+                        } else {
+                            pendingExport = payload
+                            pendingExportName = "workbuddy-accounts-${app.accounts.length()}.json"
+                            exportLauncher.launch(pendingExportName)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(PcTokens.SectionGap))
+                PcNote(
+                    "「切换账号登录」会先清空登录态，用于在同一台设备上登录第二个账号；" +
+                        "导入支持 WorkBuddy / CodeBuddy 的 .info 与 JSON 认证文件。"
                 )
             }
         }
+
         // ---------------- 账号池 ----------------
         if (app.accounts.length() == 0) {
+            item { PcSection("账号池") }
             item {
-                PcCard(title = "尚未连接账号") {
-                    Text(
-                        "在 App 内置窗口完成登录（不跳浏览器），或导入 WorkBuddy / CodeBuddy 的 .info、JSON 文件。",
-                        style = MiuixTheme.textStyles.body2,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                    )
-                }
+                PcEmptyCard("还没有账号。用上方按钮登录（App 内置窗口，不跳浏览器），或导入认证文件。")
             }
         } else {
-            item { SmallTitle(text = "账号池 · ${app.accounts.length()} 个") }
+            item {
+                PcSection("账号池 · ${app.accounts.length()} 个")
+            }
             items(app.accounts.length()) { index ->
                 val account = app.accounts.optJSONObject(index) ?: return@items
-                val uid = account.optString("uid")
-                val accountKey = account.optString("account_key", uid)
-                val nickname = account.optString("nickname", "WorkBuddy 用户")
                 AccountCard(
                     account = account,
-                    accountKey = accountKey,
-                    nickname = nickname,
                     app = app,
-                    onExport = {
-                        scope.launch {
-                            val payload = withContext(Dispatchers.IO) { app.exportAccount(accountKey) }
-                            if (payload.isNullOrBlank()) {
-                                showExportResult = "该账号没有可导出的认证数据"
-                            } else {
-                                pendingExport = payload
-                                pendingExportName = "workbuddy-${FormatKit.safeFileName(nickname.ifBlank { uid })}.json"
-                                exportLauncher.launch(pendingExportName)
-                            }
-                        }
-                    },
+                    onMore = { moreSheetAccount = account },
                     onShowCredits = {
-                        creditAccountKey = accountKey
-                        creditAccountName = nickname
-                        creditDetail = null           // 先置空，弹窗内显示"读取中"
-                        showCreditDetail = true
+                        creditAccountKey = account.optString("account_key", account.optString("uid"))
+                        creditAccountName = FormatKit.accountName(
+                            account.optString("nickname"), account.optString("uid")
+                        )
+                        creditDetail = null // 先置空，弹窗内显示"读取中"
                         scope.launch {
-                            creditDetail = withContext(Dispatchers.IO) { app.loadCreditDetail(accountKey) }
+                            creditDetail = withContext(Dispatchers.IO) {
+                                app.loadCreditDetail(
+                                    account.optString("account_key", account.optString("uid"))
+                                )
+                            }
                         }
                     }
                 )
@@ -197,113 +210,59 @@ fun AccountsScreen(context: Context, app: AppState) {
         }
 
         // ---------------- 批量操作 ----------------
-        item { SmallTitle(text = "账号操作") }
-        item {
-            PcCard {
-                Button(
-                    onClick = { app.refreshCredits() },
-                    enabled = !app.busy,
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text(if (app.busy) "刷新中…" else "刷新全部账号额度") }
-                Spacer(Modifier.height(PcTokens.SpaceS))
-                TextButton(
-                    text = "为全部启用的国内账号签到",
-                    onClick = { app.checkInAll() },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(PcTokens.SpaceS))
-                Text(
-                    "额度会按账号逐个刷新并汇总；批量签到只处理国内账号，国际版额度由上游自动发放。",
-                    style = MiuixTheme.textStyles.body2,
-                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                )
-            }
-        }
-
-        // ---------------- 额度汇总 ----------------
-        val summary = app.credits
-        if (summary != null && summary.optInt("known") > 0) {
-            item { SmallTitle(text = "额度汇总") }
+        if (app.accounts.length() > 0) {
+            item { PcSection("批量操作") }
             item {
                 PcCard {
-                    Text(
-                        "${FormatKit.credits(summary.optDouble("remain"))} / ${FormatKit.credits(summary.optDouble("total"))} 积分",
-                        style = MiuixTheme.textStyles.title3,
-                        color = MiuixTheme.colorScheme.primary
+                    PcActionGrid(
+                        actions = listOf(
+                            PcAction(
+                                label = if (app.busy) "刷新中…" else "刷新全部额度",
+                                primary = true,
+                                enabled = !app.busy
+                            ) { app.refreshCredits() },
+                            PcAction("全部国内账号签到", enabled = !app.busy) { app.checkInAll() }
+                        )
                     )
-                    Spacer(Modifier.height(PcTokens.SpaceS / 2))
-                    Text(
-                        "已汇总 ${summary.optInt("known")} / ${summary.optInt("accounts")} 个账号",
-                        style = MiuixTheme.textStyles.body2,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                    )
-                    val total = summary.optDouble("total")
-                    val ratio = if (total > 0) (summary.optDouble("remain") / total).toFloat().coerceIn(0f, 1f) else 0f
-                    Spacer(Modifier.height(PcTokens.SpaceS))
-                    LinearProgressIndicator(progress = ratio, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(PcTokens.SectionGap))
+                    PcNote("额度按账号逐个刷新后汇总；批量签到只处理国内账号，国际版额度由上游自动发放。")
                 }
             }
         }
 
         // ---------------- 签到结果 ----------------
-        app.checkinResults?.let { results ->
-            if (results.length() > 0) {
-                item { SmallTitle(text = "最近签到结果") }
-                items(results.length()) { index ->
-                    val result = results.optJSONObject(index) ?: return@items
-                    // 状态文案要区分三种"没签到"的原因，否则用户无法判断
-                    // 是"该做的都做了"还是"有问题"：
-                    //   · 国际版         → 本来就没有签到这个动作
-                    //   · 账号已停用     → 用户自己关的
-                    //   · 今日已签到     → 正常，已签过
-                    val status = when {
-                        !result.optBoolean("checkin_supported", true) && result.optBoolean("skipped") ->
-                            if (result.optBoolean("ok")) "国际版不适用" else "国际版刷新失败"
-                        result.optBoolean("skipped") -> "已跳过"
-                        result.optBoolean("already") -> "今日已签到"
-                        result.optBoolean("ok") -> "签到成功"
-                        else -> "签到失败"
-                    }
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = PcTokens.PageGutter),
-                        insideMargin = PaddingValues(horizontal = PcTokens.SpaceL, vertical = PcTokens.SpaceM)
-                    ) {
-                        Column {
-                            Text(
-                                FormatKit.accountName(result.optString("nickname"), result.optString("uid")),
-                                style = MiuixTheme.textStyles.main
-                            )
-                            Spacer(Modifier.height(PcTokens.SpaceS / 2))
-                            Text(
-                                "$status · UID ${FormatKit.shortUid(result.optString("uid"))}",
-                                style = MiuixTheme.textStyles.body2,
-                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                            )
-                            if (result.optString("message").isNotBlank()) {
-                                Text(
-                                    result.optString("message"),
-                                    style = MiuixTheme.textStyles.body2,
-                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                                )
-                            }
-                            // 本次到账的积分单独一行高亮：这是签到最核心的结果，
-                            // 混在说明文案里不容易看见。
-                            if (!result.isNull("credits_gained")) {
-                                val gained = result.optDouble("credits_gained", 0.0)
-                                if (gained != 0.0) {
-                                    Text(
-                                        "本次 " + if (gained > 0) "+%.1f".format(gained) else "%.1f".format(gained) + " 积分",
-                                        style = MiuixTheme.textStyles.main,
-                                        color = if (gained > 0) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.error
-                                    )
-                                }
-                            }
-                        }
-                    }
+        //
+        // checkinResults 是 AppState 上的可变状态，直接在 LazyList content lambda 里
+        // 反复读取会让"读状态"这件事发生在非组合作用域；这里先用局部 val 固化一次，
+        // 后面的统计与弹窗都复用它（弹窗在 LazyList 之外引用同一个值）。
+        if (results != null && results.length() > 0) {
+            val okCount = (0 until results.length()).count { results.optJSONObject(it).optBoolean("ok") }
+            val failedCount = (0 until results.length()).count {
+                val item = results.optJSONObject(it)
+                !item.optBoolean("ok") && !item.optBoolean("skipped")
+            }
+            val gained = (0 until results.length()).sumOf { i ->
+                val item = results.optJSONObject(i) ?: return@sumOf 0.0
+                if (item.isNull("credits_gained")) 0.0 else item.optDouble("credits_gained", 0.0)
+            }
+            item { PcSection("最近签到") }
+            item {
+                PcCard {
+                    PcMetricRow(
+                        listOf(
+                            PcMetric("成功 / 已签", okCount.toString(), MiuixTheme.colorScheme.primary),
+                            PcMetric("失败", failedCount.toString(), if (failedCount > 0) MiuixTheme.colorScheme.error else null),
+                            PcMetric("本次到账", "+%.1f".format(gained))
+                        )
+                    )
+                    Spacer(Modifier.height(PcTokens.SectionGap))
+                    PcWideButton(text = "查看每个账号的结果", primary = false) { showCheckinDetail = true }
                 }
             }
         }
     }
+
+    // ---------------- 弹窗区 ----------------
 
     PcAlertDialog(
         show = importError != null,
@@ -318,138 +277,297 @@ fun AccountsScreen(context: Context, app: AppState) {
         onDismiss = { showExportResult = null }
     )
 
-    // 积分详情弹窗：按账号查看积分来源（签到/奖励）与去向（消耗）
-    if (showCreditDetail) {
+    // 签到结果明细：从"每账号一张卡"改成"一句话汇总 + 明细弹窗"，
+    // 因为签到结果只在刚点完的十几秒内有价值，不该长期占据账号页版面。
+    if (showCheckinDetail && results != null) {
+        PcLogDialog(
+            show = true,
+            title = "签到结果（${results.length()} 个账号）",
+            lines = buildCheckinLines(results),
+            onDismiss = { showCheckinDetail = false }
+        )
+    }
+
+    // 积分详情：按账号查看积分来源（签到/奖励/消耗）与去向
+    creditAccountKey?.let { key ->
         CreditDetailDialog(
             accountName = creditAccountName,
             detail = creditDetail,
             onRefresh = {
                 creditDetail = null
                 scope.launch {
-                    creditDetail = withContext(Dispatchers.IO) { app.loadCreditDetail(creditAccountKey) }
+                    creditDetail = withContext(Dispatchers.IO) { app.loadCreditDetail(key) }
                 }
             },
             onClearLedger = {
-                app.clearCreditLedger(creditAccountKey)
+                app.clearCreditLedger(key)
                 scope.launch {
-                    creditDetail = withContext(Dispatchers.IO) { app.loadCreditDetail(creditAccountKey) }
+                    creditDetail = withContext(Dispatchers.IO) { app.loadCreditDetail(key) }
                 }
             },
-            onDismiss = { showCreditDetail = false }
-        )
-    }
-}
-
-/** 单个账号卡片：状态、额度、签到、优先级、启停、导出、删除。 */
-@Composable
-private fun AccountCard(
-    account: org.json.JSONObject,
-    accountKey: String,
-    nickname: String,
-    app: AppState,
-    onExport: () -> Unit,
-    onShowCredits: () -> Unit
-) {
-    val uid = account.optString("uid")
-    val enabled = account.optBoolean("enabled", true)
-    val healthy = account.optBoolean("healthy")
-    var showPriority by remember { mutableStateOf(false) }
-    var showDelete by remember { mutableStateOf(false) }
-
-    Card(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = PcTokens.PageGutter),
-        insideMargin = PaddingValues(horizontal = PcTokens.SpaceL, vertical = PcTokens.SpaceM)
-    ) {
-        Column {
-            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Text(nickname, style = MiuixTheme.textStyles.main, modifier = Modifier.weight(1f))
-                Text(
-                    when {
-                        healthy -> "● 健康"
-                        enabled -> "冷却"
-                        else -> "已停用"
-                    },
-                    style = MiuixTheme.textStyles.body2,
-                    color = if (healthy) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.onSurfaceVariantSummary
-                )
-            }
-            Spacer(Modifier.height(PcTokens.SpaceS))
-            PcInfoRow("版本", account.optString("region_label", "国内版"))
-            // UID 用等宽 + 固定标签列宽：此前用 PcInfoRow 的权重布局，短标签 "UID"
-            // 被长值挤成逐字竖排（截图可见 U/I/D 三行）。
-            PcMonoRow("UID", uid)
-            PcInfoRow("优先级", "${account.optInt("priority")}（权重 ×${account.optInt("priority") + 1}）")
-            PcInfoRow(
-                "剩余 / 总额度",
-                if (account.isNull("credits_remaining")) "尚未刷新"
-                else "${FormatKit.credits(account.optDouble("credits_remaining"))} / ${FormatKit.credits(account.optDouble("credits_total"))} 积分"
-            )
-            val isInternational = AccountRegion.from(account.optString("region")) == AccountRegion.INTERNATIONAL
-            PcInfoRow(
-                if (isInternational) "额度发放" else "今日签到",
-                if (isInternational) "自动发放 · 刷新额度即可"
-                else if (isCheckedInToday(account.optString("last_checkin_date"))) "已签到" else "未签到"
-            )
-            Spacer(Modifier.height(PcTokens.SpaceM))
-            // 统一走 PcActionGrid：等宽、按钮间有固定间距、奇数个自动折行且不拉伸。
-            // 「积分详情」放首位并作为主按钮：按账号核对积分来源是高频需求。
-            PcActionGrid(
-                actions = listOf(
-                    PcAction("积分详情", primary = true) { onShowCredits() },
-                    PcAction(if (enabled) "停用" else "启用") {
-                        app.setAccountEnabled(accountKey, !enabled)
-                    },
-                    PcAction("优先级") { showPriority = true },
-                    PcAction("导出") { onExport() },
-                    PcAction("删除账号") { showDelete = true }
-                )
-            )
-        }
-    }
-
-    if (showPriority) {
-        PriorityDialog(
-            initial = account.optInt("priority"),
-            accountLabel = "$nickname · ${FormatKit.shortUid(uid)}",
-            onDismiss = { showPriority = false },
-            onConfirm = { value ->
-                app.setAccountPriority(accountKey, value)
-                showPriority = false
-            }
+            onDismiss = { creditAccountKey = null }
         )
     }
 
-    PcConfirmDialog(
-        show = showDelete,
-        title = "删除账号？",
-        message = "${account.optString("region_label")} · $uid\n\n删除后该账号的登录凭证将从本机移除，无法恢复。",
-        confirmText = "删除",
-        onConfirm = { app.deleteAccount(accountKey, nickname); showDelete = false },
-        onDismiss = { showDelete = false }
-    )
+    // 单账号「更多」——低频操作的收容所
+    moreSheetAccount?.let { account ->
+        val accountKey = account.optString("account_key", account.optString("uid"))
+        val nickname = account.optString("nickname", "WorkBuddy 用户")
+        val uid = account.optString("uid")
+        AccountMoreDialog(
+            account = account,
+            onExport = {
+                moreSheetAccount = null
+                exportAccount(account, accountKey, nickname, uid)
+            },
+            onSetPriority = { priority ->
+                app.setAccountPriority(accountKey, priority)
+                moreSheetAccount = null
+            },
+            onToggleEnabled = {
+                app.setAccountEnabled(accountKey, !account.optBoolean("enabled", true))
+                moreSheetAccount = null
+            },
+            onDelete = {
+                app.deleteAccount(accountKey, nickname)
+                moreSheetAccount = null
+            },
+            onDismiss = { moreSheetAccount = null }
+        )
+    }
 }
 
 /**
- * 优先级设置对话框 —— 对应原界面的 showPriorityDialog。
+ * 单个账号卡。
  *
- * 保留原版的三条调节路径（步进 / 滑块 / 快捷档位），因为优先级是「选号概率」，
- * 用户往往需要反复微调，单一滑块不好精确定位。
+ * 布局顺序刻意与"用户扫读顺序"一致：
+ *   昵称 → 状态 → 额度条 → 版本/UID/签到 → 高频按钮 → 更多
+ * 而不是先铺一排键值再放按钮（上一版就是这样，导致同一张卡里"剩余额度"
+ * 夹在"优先级"和"签到状态"之间，扫读时容易跳过）。
  */
 @Composable
-private fun PriorityDialog(
-    initial: Int,
-    accountLabel: String,
-    onDismiss: () -> Unit,
-    onConfirm: (Int) -> Unit
+private fun AccountCard(
+    account: JSONObject,
+    app: AppState,
+    onMore: () -> Unit,
+    onShowCredits: () -> Unit
 ) {
-    var value by remember { mutableStateOf(initial.coerceIn(0, 20)) }
-    PcPriorityDialogContent(
-        value = value,
-        onValueChange = { value = it },
-        accountLabel = accountLabel,
-        onDismiss = onDismiss,
-        onConfirm = { onConfirm(value) }
+    val uid = account.optString("uid")
+    val nickname = FormatKit.accountName(account.optString("nickname"), uid)
+    val enabled = account.optBoolean("enabled", true)
+    val healthy = account.optBoolean("healthy")
+    val accountKey = account.optString("account_key", uid)
+    val isInternational = AccountRegion.from(account.optString("region")) == AccountRegion.INTERNATIONAL
+    val hasCredits = !account.isNull("credits_remaining")
+
+    PcCard {
+        // 标题行：昵称 + 状态
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                nickname,
+                style = MiuixTheme.textStyles.main,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            PcStatus(
+                text = when {
+                    !enabled -> "已停用"
+                    healthy -> "健康"
+                    else -> "冷却中"
+                },
+                positive = enabled && healthy
+            )
+        }
+
+        // 额度条：只有拿到过额度才画，否则显示"未刷新"（不画一条假的 0%）
+        Spacer(Modifier.height(PcTokens.RowGap))
+        if (hasCredits) {
+            val remain = account.optDouble("credits_remaining")
+            val total = account.optDouble("credits_total")
+            val ratio = if (total > 0) (remain / total).toFloat().coerceIn(0f, 1f) else 0f
+            LinearProgressIndicator(progress = ratio, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(PcTokens.RowGap / 2))
+            Text(
+                "剩余 ${FormatKit.credits(remain)} / ${FormatKit.credits(total)} 积分（${(ratio * 100).toInt()}%）",
+                style = MiuixTheme.textStyles.body2,
+                color = MiuixTheme.colorScheme.primary
+            )
+        } else {
+            Text(
+                "额度尚未刷新",
+                style = MiuixTheme.textStyles.body2,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+            )
+        }
+
+        Spacer(Modifier.height(PcTokens.RowGap))
+        PcInfoRow("版本", account.optString("region_label", "国内版"))
+        PcInfoRow(
+            if (isInternational) "额度发放" else "今日签到",
+            if (isInternational) {
+                "自动发放 · 刷新额度即可"
+            } else if (isCheckedInToday(account.optString("last_checkin_date"))) {
+                "已签到"
+            } else {
+                "未签到"
+            }
+        )
+        PcMonoRow("UID", uid)
+
+        Spacer(Modifier.height(PcTokens.SectionGap))
+        // 高频动作留在卡上：积分详情（核对积分来源）与更多（导出/优先级/删除）。
+        // 中间两个位置刻意留空，不用 4 个按钮填满 —— 账号卡的重点是"读"，不是"按"。
+        PcActionGrid(
+            actions = listOf(
+                PcAction("积分详情", primary = true) { onShowCredits() },
+                PcAction("更多操作") { onMore() }
+            )
+        )
+    }
+}
+
+/**
+ * 单账号「更多」弹窗 —— 低频操作的收容所。
+ *
+ * 为什么把优先级做成这个弹窗里的一栏而不是独立弹窗：
+ * 优先级是一个 0..20 的整数，用户在切号不顺手时才会来调它，
+ * 而且调完通常还要顺手做点别的（停用/导出）。放在同一层减少一次跳转。
+ */
+@Composable
+private fun AccountMoreDialog(
+    account: JSONObject,
+    onExport: () -> Unit,
+    onSetPriority: (Int) -> Unit,
+    onToggleEnabled: () -> Unit,
+    onDelete: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val uid = account.optString("uid")
+    val nickname = FormatKit.accountName(account.optString("nickname"), uid)
+    val enabled = account.optBoolean("enabled", true)
+    var priority by remember(uid) { mutableStateOf(account.optInt("priority").coerceIn(0, 20)) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    top.yukonga.miuix.kmp.window.WindowDialog(
+        show = true,
+        title = nickname,
+        summary = "${account.optString("region_label", "国内版")} · ${FormatKit.shortUid(uid)}",
+        onDismissRequest = onDismiss,
+        content = {
+            Column(Modifier.fillMaxWidth()) {
+                // 优先级：数值 + 滑块 + 快捷档位三条路径并存。
+                // 只给滑块在"从 0 调到 1"这种微调上很难精确定位；
+                // 只给步进在大跨度调整上又太慢 —— 两者都要有。
+                Text("选号优先级", style = MiuixTheme.textStyles.main)
+                Spacer(Modifier.height(2.dp))
+                PcNote("权重 ×${priority + 1}。只影响多账号之间的选号概率，额度、成功率与闲置时长仍照常参与加权。")
+                Spacer(Modifier.height(PcTokens.RowGap))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    top.yukonga.miuix.kmp.basic.TextButton(
+                        text = "−",
+                        onClick = { if (priority > 0) priority -= 1 },
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        priority.toString(),
+                        style = MiuixTheme.textStyles.title2,
+                        color = MiuixTheme.colorScheme.primary,
+                        modifier = Modifier.weight(1f),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    top.yukonga.miuix.kmp.basic.TextButton(
+                        text = "+",
+                        onClick = { if (priority < 20) priority += 1 },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                top.yukonga.miuix.kmp.basic.Slider(
+                    value = priority.toFloat(),
+                    onValueChange = { priority = it.toInt().coerceIn(0, 20) },
+                    valueRange = 0f..20f,
+                    steps = 19,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(PcTokens.ButtonGap)) {
+                    listOf(0, 1, 2, 5, 10).forEach { preset ->
+                        top.yukonga.miuix.kmp.basic.TextButton(
+                            text = if (preset == priority) "● $preset" else preset.toString(),
+                            onClick = { priority = preset },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                Spacer(Modifier.height(PcTokens.RowGap))
+                PcWideButton(text = "保存优先级") { onSetPriority(priority) }
+
+                Spacer(Modifier.height(PcTokens.SectionGap))
+                PcDivider()
+                Spacer(Modifier.height(PcTokens.SectionGap))
+
+                PcActionGrid(
+                    actions = listOf(
+                        PcAction(if (enabled) "停用该账号" else "启用该账号") { onToggleEnabled() },
+                        PcAction("导出该账号") { onExport() }
+                    )
+                )
+                Spacer(Modifier.height(PcTokens.ButtonGap))
+                // 删除单独一行并用错误色：它是唯一不可撤销的操作，
+                // 与"停用/导出"混在同一行会显著提高误触概率。
+                top.yukonga.miuix.kmp.basic.TextButton(
+                    text = "删除该账号",
+                    onClick = { confirmDelete = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = top.yukonga.miuix.kmp.basic.ButtonDefaults.textButtonColors(
+                        color = MiuixTheme.colorScheme.errorContainer,
+                        textColor = MiuixTheme.colorScheme.error
+                    )
+                )
+                Spacer(Modifier.height(PcTokens.RowGap))
+                PcNote("导出会包含登录凭证；删除会从本机移除该账号的认证数据，无法恢复。")
+            }
+        }
     )
+
+    PcConfirmDialog(
+        show = confirmDelete,
+        title = "删除账号？",
+        message = "${account.optString("region_label", "国内版")} · $uid\n\n删除后该账号的登录凭证将从本机移除，无法恢复。",
+        confirmText = "删除",
+        danger = true,
+        onConfirm = {
+            confirmDelete = false
+            onDelete()
+        },
+        onDismiss = { confirmDelete = false }
+    )
+}
+
+/** 把签到结果拍成"一行一个账号"，供弹窗渲染（首字符带符号，弹窗会按符号着色）。 */
+private fun buildCheckinLines(results: JSONArray): List<String> = buildList {
+    for (i in 0 until results.length()) {
+        val item = results.optJSONObject(i) ?: continue
+        val mark = when {
+            item.optBoolean("skipped") -> "·"
+            item.optBoolean("ok") -> "✓"
+            else -> "✗"
+        }
+        val status = when {
+            !item.optBoolean("checkin_supported", true) && item.optBoolean("skipped") ->
+                if (item.optBoolean("ok")) "国际版不适用" else "国际版刷新失败"
+            item.optBoolean("skipped") -> "已跳过"
+            item.optBoolean("already") -> "今日已签到"
+            item.optBoolean("ok") -> "签到成功"
+            else -> "签到失败"
+        }
+        val gained = if (item.isNull("credits_gained")) "" else {
+            val value = item.optDouble("credits_gained", 0.0)
+            if (value != 0.0) " · " + if (value > 0) "+%.1f 积分".format(value) else "%.1f 积分".format(value) else ""
+        }
+        val name = FormatKit.accountName(item.optString("nickname"), item.optString("uid"))
+        val message = item.optString("message").takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""
+        add("$mark $name：$status$gained$message")
+    }
 }
 
 /** 判断今天是否已签到（本地日期比较，不依赖上游时区）。 */
@@ -462,8 +580,8 @@ internal fun isCheckedInToday(lastDate: String): Boolean {
 /**
  * 发起 OAuth 登录（内置窗口 + 轮询）。
  *
- * 与原实现一致：默认清空 WebView 会话，因为 Google / GitHub 只要留有上次的登录
- * Cookie，再点登录会被静默授权到同一账号，用户永远换不到第二个账号。
+ * 与原实现一致：默认清空 WebView 会话 —— 因为 Google / GitHub 只要留有上次的登录
+ * Cookie，再点登录会被静默授权回同一账号，用户永远换不到第二个账号。
  * 轮询成功后才关闭窗口并刷新列表。
  */
 internal fun startOAuth(
@@ -494,7 +612,12 @@ internal fun startOAuth(
 }
 
 /** 轮询登录结果，最多 150 次 × 2 秒（与原实现一致）。 */
-private fun pollOAuth(activity: Activity, session: com.joy4fire.workbuddy2api.OAuthSession, app: AppState, attempts: Int) {
+private fun pollOAuth(
+    activity: Activity,
+    session: com.joy4fire.workbuddy2api.OAuthSession,
+    app: AppState,
+    attempts: Int
+) {
     if (activity.isFinishing) return
     activity.window.decorView.postDelayed({
         if (activity.isFinishing) return@postDelayed

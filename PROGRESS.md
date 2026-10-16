@@ -87,3 +87,82 @@
   - 交互验证用 `android.util.Log` + `logcat -d -s TAG:I`；
   - **字段名必须用真机响应核对，不要凭反编译或记忆臆测**（成长任务字段名踩过两次）；
   - 判断"崩没崩"看 `logcat -b crash -d`，`died->visible` 是系统回收不是崩溃。
+
+---
+
+## UI 全量重写（进行中 · 续跑锚点）
+
+### 目标
+重写整套 UI：单一 Miuix 界面、修交互缺陷、只读信息从卡片堆叠改为原生列表组件、
+二级页顶栏返回分级、统一设计令牌，并保证可编译产出真机 APK。
+
+### 观察到的旧版缺陷（重写依据）
+1. 间距体系崩坏：同屏出现 10/12/14/16/5/2dp 六种间距，页面各自塞 Spacer 补救。
+2. `PcCard` 自带横向 padding + 又传 insideMargin，形成双重缩进。
+3. `PcInfoRow` 用 weight 分列 → 短标签（UID）被压成逐字竖排（有截图实锤）。
+4. 按钮手工 Row 摆放散落 6 个页面：忘加间距 / 同行宽窄不一 / 奇数个被 weight 拉满整行。
+5. 二级页只有一个「返回」文字按钮且固定回所属 Tab；实际二级页可从多 Tab 进入
+   （用量统计来自概览与设置），于是"返回回到莫名其妙的地方"。
+6. 设置页首屏 16 个可交互组件 + 5 个常驻 TextField（每个启动 4 个动画）→ 首屏 2612ms。
+7. 概览/记录/模型把整张表铺成卡片墙（100 条记录 = 100 卡 × 7 行）。
+8. 长文本（出网取证 body 可达上百 KB）交给单个 Text() 渲染 → 渲染超时闪退。
+9. 编辑器类弹窗复用位置时保留上一次输入（串值）。
+10. 账号卡 5 个等宽按钮且「删除」与「停用」相邻，误触代价高。
+11. 启动中 `enabled` 被 starting 锁死 → 反复启停后再也停不掉。
+
+### 已完成（代码全部落盘）
+- `ui/PcDesign.kt`（新）语义化令牌：PageInset/BlockGap/TitleGap/RowGap/SectionGap/
+  ButtonGap/BottomInset/TopInset/LabelWidth/DialogBodyMax/DetailBodyMax/ListPadding/CardInside。
+- `ui/PcComponents.kt`（重写）PcList / PcSection / PcCard / PcDivider / PcGap / PcHGap /
+  PcRow / PcClickRow / PcInfoRow（固定标签列宽）/ PcMonoRow / PcMetricRow+PcMetric /
+  PcStatus / PcNote / PcErrorText / PcEmptyCard / PcActionGrid+PcAction / PcWideButton。
+  核心：布局约束外置，间距责任唯一化。
+- `ui/PcDialogs.kt`（新）PcConfirmDialog(danger) / PcAlertDialog / PcInputDialog /
+  PcDetailDialog（12000 字符渲染上限 + 复制原文）/ PcLogDialog / DialogState。
+  统一 WindowDialog（非 OverlayDialog），规避 NavigationEventDispatcher 崩溃链。
+- `ui/AppShell.kt`（重写）6 Tab + 7 二级页；subOrigin 记住来源；IconButton 返回
+  （ArrowRight rotate 180°）；Snackbar 承载瞬时提示；BackHandler 三级分级；
+  去掉冗余第二层 ProvideNavigationEventDispatcher（保留 NavCompat 包外层）。
+- `ui/OverviewScreen.kt`（重写）服务卡→指标卡→额度条→待办→入口 五层；
+  活动日志降级弹窗；启动中可取消启动；TodoItem 数据类（弃用 Triple）。
+- `ui/AccountsScreen.kt`（重写）账号卡压缩；「更多」弹窗收纳低频操作；
+  签到结果汇总+明细弹窗；删除单独一行错误色；保留全部原功能（登录/切换/导入/导出/
+  启停/优先级/积分详情/批量刷新/批量签到）。
+- `ui/ModelsScreen.kt`（重写）分组清单（每组一卡），版本短标签，能力/上下文/成本一行。
+- `ui/AppsScreen.kt`（重写）接入参数卡可一键复制；Key 列表一卡多行；详情/编辑弹窗。
+- `ui/RecordsScreen.kt`（重写）一卡内三行紧凑记录；进页自动拉取；详情按需读全文。
+- `ui/GrowthScreen.kt`（重写）任务行减半高；「更多操作」弹窗；日志自动弹窗；
+  列表 key 用「索引:code」避免 Key "" already used。
+- `ui/SettingsScreen.kt`（重写）首屏 7 组件；分组入口下钻。
+- `ui/SubScreens.kt`（重写）Usage / Inspector / Storage / KeepAlive / Schedule 五页。
+- `ui/SettingRow.kt`（重写）点击弹窗编辑 + PriorityDialog（步进/滑块/快捷档位三路径）。
+
+### 剩余工作（下段从这里继续，按序执行）
+1. **写 `ui/CreditDetailDialog.kt`**：AccountsScreen 已按
+   `CreditDetailDialog(accountName, detail: JSONObject?, onRefresh, onClearLedger, onDismiss)`
+   调用。需实现：积分总量/已用/剩余、来源分类（签到/奖励/消耗）、
+   过期提醒、清空台账确认（danger）、明细滚动限高。
+2. **核对并补齐 AppState API**（编译器会报错，逐个补）：
+   读取类 `usageSummary / usageSeries / usageRecords / usageTotal / revision /
+   checkinResults / selectedAccount`；
+   方法类 `loadUsageIfStale / loadUsage / usageDetail(id) / deleteUsage(id) /
+   clearUsage(total) / storageInfo / storageBreakdown / inspectorEntries /
+   inspectorEnabled / inspectorExport / setInspectorEnabled / clearInspector /
+   clearWebViewCache / trimUsage / cleanupUsage(days) / loadSettings / saveSetting /
+   loadCreditDetail(key) / clearCreditLedger(key) / appKey(id) / showMessage / clearMessage /
+   toggleServer / refreshCredits / refreshModels / loadAccounts / importAuth / exportAccount /
+   exportAllAccounts / setAccountPriority / setAccountEnabled / deleteAccount / checkInAll /
+   createApp / updateApp / deleteApp / toggleApp`。
+3. `assembleDebug` 编译，逐一修 Kotlin 错误（预计集中在：Miuix 组件参数名、
+   `Icons.Layers` 扩展图标是否存在于 miuix-icons、TextField 两套 API 的选择、
+   `rememberTextFieldState`/`snapshotFlow` 的导入）。
+4. 装机验证：二级页返回、各弹窗不崩、服务启停、账号卡按钮、Key 创建/查看、记录详情。
+
+### 关键技术约定（勿违反）
+- 弹窗一律 `WindowDialog`（`OverlayDialog` 在纯 Compose 宿主会崩）。
+- `WindowDialog`/`OverlayDialog` **没有 buttons 参数**，按钮写进 content。
+- 图标只用 miuix-ui 自带的 `MiuixIcons.Basic.*`，或 miuix-icons 扩展（需确认存在）。
+- 卡片内左右边距只由容器 insideMargin 提供，行组件永远不加横向 padding。
+- 长文本先裁剪到 12000 字符再渲染，复制走原文。
+- 构建配方见 memory `miuix-arm64-build-recipe`（AGP 8.13.2 / Gradle 8.14.2 /
+  `compileSdkVersion("android-37.0")` / platform 目录 android-37.0）。
