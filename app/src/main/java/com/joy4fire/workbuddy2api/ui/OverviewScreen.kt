@@ -10,7 +10,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -20,13 +23,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.joy4fire.workbuddy2api.ApiHostService
 import com.joy4fire.workbuddy2api.FormatKit
 import com.joy4fire.workbuddy2api.ServerPort
 import top.yukonga.miuix.kmp.basic.LinearProgressIndicator
+import top.yukonga.miuix.kmp.basic.Surface
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -57,6 +64,8 @@ fun OverviewScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
     val currentPort = ServerPort.current(context)
     var showEvents by remember { mutableStateOf(false) }
     var showAccountDetail by remember { mutableStateOf(false) }
+    // 网关端口在概览页直接可改：这里是编辑弹窗的开关。
+    var showPortEditor by remember { mutableStateOf(false) }
 
     // 概览只需要「今日请求 / 今日 Tokens」两个摘要字段，因此这里按需拉取，
     // 而不是把全表聚合的 loadUsage 塞进启动路径（那会让首屏变慢）。
@@ -90,15 +99,43 @@ fun OverviewScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                 Spacer(Modifier.height(PcTokens.SectionGap))
 
                 // 地址是"要抄到别的设备上去"的东西，因此独占一行、等宽显示。
-                Text(
-                    ServerPort.baseUrl(currentPort),
-                    style = MiuixTheme.textStyles.body2,
-                    fontFamily = FontFamily.Monospace,
-                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                // 点击整行即可改端口：网关地址里的端口是用户最常想改的东西，
+                // 把它藏在设置页会让"想换端口"多跳两层。
+                Surface(
+                    onClick = { showPortEditor = true },
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color.Transparent,
                     modifier = Modifier.fillMaxWidth()
-                )
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            ServerPort.baseUrl(currentPort),
+                            style = MiuixTheme.textStyles.body2,
+                            fontFamily = FontFamily.Monospace,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "修改",
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.primary
+                        )
+                    }
+                }
+
+                // 端口改完不会立即生效，这里如实暴露"保存值 ≠ 监听值"的中间态，
+                // 否则用户改完看到地址变了，却连不上，会以为功能坏了。
+                val listeningPort = ApiHostService.listeningPort
+                if (!running) {
+                    Spacer(Modifier.height(PcTokens.RowGap))
+                    PcNote("端口 $currentPort 已保存，启动服务后生效。")
+                } else if (listeningPort > 0 && listeningPort != currentPort) {
+                    Spacer(Modifier.height(PcTokens.RowGap))
+                    PcNote("端口已改为 $currentPort，重启服务后生效（当前仍监听 $listeningPort）。")
+                }
 
                 Spacer(Modifier.height(PcTokens.SectionGap))
 
@@ -215,16 +252,10 @@ fun OverviewScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                     )
                 )
             }
-            if (!running && !starting && app.accounts.length() > 0) {
-                add(
-                    TodoItem(
-                        title = "服务未启动",
-                        hint = "启动后局域网内的客户端才能调用这个 API。",
-                        actionLabel = "立即启动服务",
-                        onAction = { app.toggleServer(activity) }
-                    )
-                )
-            }
+            // 注意：这里刻意不再提供「立即启动服务」待办。
+            // 顶部服务卡的主按钮在 stopped 状态下就是「启动服务」，且始终可见；
+            // 若这里再放一个同 action 的按钮，未启动 + 有账号时两者会同时出现，
+            // 表现为「启动功能有两个」。同一个动作只保留一个入口。
         }
         if (todos.isNotEmpty()) {
             item {
@@ -278,6 +309,51 @@ fun OverviewScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
         AccountCreditsDialog(
             accounts = accounts,
             onDismiss = { showAccountDetail = false }
+        )
+    }
+
+    if (showPortEditor) {
+        // 概览页直接改端口：用户在这里看到网关地址，想改端口自然也在同一处动手，
+        // 不需要先跳到设置页再找一遍。校验与「改完要重启」的提示复用 SettingsScreen 里
+        // PortSettingRow 的同一套 ServerPort 规则，避免两个入口两套判断。
+        val saved = remember(app.revision) { ServerPort.current(context) }
+        val live = if (app.serviceRunning) ApiHostService.listeningPort else 0
+        // 输入值只在弹窗打开期间有效：打开时以"当前保存值"为初值，
+        // 但之后与 app.revision 脱钩，否则后台刷新会把用户正在敲的数字冲掉。
+        var input by remember(showPortEditor) { mutableStateOf(saved.toString()) }
+        val parsed = ServerPort.normalize(input)
+        val invalid = parsed == null
+        val unchanged = parsed == saved
+        PcInputDialog(
+            show = true,
+            title = "本地端口",
+            label = "端口（1024 - 65535）",
+            value = input,
+            onValueChange = { input = it },
+            confirmText = "保存",
+            errorText = when {
+                invalid -> "请输入 1024 - 65535 之间的数字（1024 以下为系统端口，普通应用无法监听）"
+                unchanged -> "与当前保存值相同，无需修改"
+                else -> null
+            },
+            hint = when {
+                live != 0 && parsed != null && parsed != live ->
+                    "保存后地址显示为 $parsed，需重启服务才会在新端口监听（当前仍监听 $live）。"
+                else -> "保存后需重启服务才会生效。"
+            },
+            onConfirm = {
+                // 校验在 onConfirm 里再做一次：输入框是自由文本，
+                // 只要 PcInputDialog 不给 disabled 能力，就必须在提交口兜住非法值。
+                if (invalid) {
+                    app.showMessage("端口需为 1024 - 65535 之间的数字")
+                } else if (ServerPort.set(context, input)) {
+                    app.showMessage("端口已保存为 ${ServerPort.current(context)}，重启服务后生效")
+                    showPortEditor = false
+                } else {
+                    app.showMessage("保存失败：端口不在 1024 - 65535 范围内")
+                }
+            },
+            onDismiss = { showPortEditor = false }
         )
     }
 }

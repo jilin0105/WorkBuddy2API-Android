@@ -210,6 +210,10 @@ class ApiHostService : Service() {
             }
             server = socket
             running = true
+            // 真实监听端口在这里落库：只有 bind 成功才发布，界面才能区分
+            // "已保存 X / 正在监听 Y"。写在 running=true 之后，避免界面读到
+            // "在跑但端口为 0" 的中间态。
+            publishListeningPort(port)
             notifyState("原生 API 运行中 · 端口 $port（本机与局域网）")
             // 前台服务通知在 onCreate 里已经用"正在启动"占位，绑定成功后立刻刷新成真实端口，
             // 否则通知栏会一直显示启动时的文案（改端口后尤其误导）。
@@ -921,6 +925,9 @@ class ApiHostService : Service() {
 
     private fun stopNow() {
         running = false
+        // 必须与 running 同步清零：否则服务停掉后界面仍显示"正在监听 8758"，
+        // 用户会以为端口已生效/服务还在跑。
+        publishListeningPort(0)
         markShouldRun(applicationContext, false)
         cancelWatchdog()
         runCatching { server?.close() }
@@ -941,6 +948,8 @@ class ApiHostService : Service() {
 
     override fun onDestroy() {
         running = false
+        // 同 stopNow：进程/服务销毁后监听端口归零，避免界面残留"正在监听"的假象。
+        publishListeningPort(0)
         runCatching { FloatingWindowKeeper.hide(this) }
         runCatching { server?.close() }
         releaseWakeLock()
@@ -972,6 +981,22 @@ class ApiHostService : Service() {
         private const val WEBVIEW_CACHE_CLEAN_THRESHOLD = 8L * 1024 * 1024
         private const val WATCHDOG_REQUEST = 8789
         @Volatile var running = false
+
+        /**
+         * 实际 bind 成功的端口，0 表示当前没有在监听。
+         *
+         * 必须与 running 分开：running 只说明"服务在跑"，而这个字段说明"跑在哪个端口"。
+         * 用户在设置页改了端口但没重启时，保存值与这里的监听值会不一致——
+         * 界面靠这个差值展示"已改为 X，重启后生效（当前仍监听 Y）"。
+         * 之前界面直接读 ServerPort.current()（保存值），导致改完没重启也显示已生效。
+         */
+        @Volatile var listeningPort: Int = 0
+            private set
+
+        /** bind 成功后由 serve() 写入；stop 时清零。 */
+        private fun publishListeningPort(port: Int) {
+            listeningPort = port
+        }
 
         /** 用户意图：true = 用户希望服务处于运行状态。
          *  持久化它有两个用途：① 开机自启时判断该不该拉起（避免用户明明关过又被拉起）；

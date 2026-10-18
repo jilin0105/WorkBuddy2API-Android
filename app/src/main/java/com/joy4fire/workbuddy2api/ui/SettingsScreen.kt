@@ -13,6 +13,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.joy4fire.workbuddy2api.ApiHostService
 import com.joy4fire.workbuddy2api.ServerPort
 import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
@@ -121,7 +122,10 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                 // 端口需要点击进入编辑，必须用可点击行。
                 PortSettingRow(
                     saved = ServerPort.current(context),
-                    active = if (app.serviceRunning) ServerPort.current(context) else null,
+                    // 必须是"实际 bind 成功的端口"，不能是 ServerPort.current()（保存值）。
+                    // 用保存值会让"改了端口但没重启"永远显示成已生效——
+                    // listeningPort 由 ApiHostService.serve() 在 bind 成功后写入，停止时清零。
+                    active = ApiHostService.listeningPort.takeIf { app.serviceRunning && it > 0 },
                     running = app.serviceRunning,
                     onSave = { port ->
                         // 通过 ServerPort 写入，保证走同一条校验与落库路径；
