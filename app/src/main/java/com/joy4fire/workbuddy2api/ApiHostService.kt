@@ -61,7 +61,7 @@ class ApiHostService : Service() {
         maintenance.scheduleWithFixedDelay({ runMaintenanceTick() }, 5, 60, TimeUnit.SECONDS)
         // 悬浮窗：可选加固项，提升进程到 VISIBLE 档，降低内存吃紧时被 LMK 回收的概率。
         // 未授权/未开启时内部自行跳过，不会影响服务本体。
-        FloatingWindowKeeper.show(this, PORT)
+        FloatingWindowKeeper.show(this, ServerPort.current(applicationContext))
     }
 
     /**
@@ -174,7 +174,11 @@ class ApiHostService : Service() {
         runCatching {
             if (intent?.action == ACTION_WATCHDOG) Log.i(TAG, "watchdog fired, ensuring foreground")
             acquireWakeLock()
-            startForeground(NOTIFICATION_ID, notification(if (running) "原生 API 运行中 · 端口 $PORT" else "正在启动原生 API…"))
+            val currentPort = ServerPort.current(applicationContext)
+            startForeground(
+                NOTIFICATION_ID,
+                notification(if (running) "原生 API 运行中 · 端口 $currentPort" else "正在启动原生 API…")
+            )
         }.onFailure { Log.w(TAG, "foreground ensure failed", it) }
         // 每次进入都续期看门狗，防止闹钟一次性触发后再无兜底。
         scheduleWatchdog()
@@ -182,11 +186,37 @@ class ApiHostService : Service() {
     }
 
     private fun serve() {
+        // 端口在 bind 那一刻才定稿：用户在设置页改端口后，需要真正重启服务才生效，
+        // 这里每次 serve() 都重新读一次，保证"改完重启即生效"。
+        val port = ServerPort.current(applicationContext)
         try {
-            val socket = ServerSocket(PORT, 32, InetAddress.getByName("0.0.0.0"))
+            val socket = try {
+                ServerSocket(port, 32, InetAddress.getByName("0.0.0.0"))
+            } catch (e: java.net.BindException) {
+                // 端口被占用是最可能出现的启动失败，必须给出可操作的提示而不是
+                // 一句 "API 异常：bind failed: EADDRINUSE"。
+                // 注意此时 running 仍为 false，下面的 catch 不会再报一次。
+                running = false
+                notifyState(
+                    "端口 $port 已被占用，请在「设置 → 定时参数」或「网络与端口」中换一个端口后重新启动"
+                )
+                Log.w(TAG, "bind failed on port $port", e)
+                return
+            } catch (e: SecurityException) {
+                running = false
+                notifyState("端口 $port 无权限监听（${ServerPort.MIN} 以下为系统端口），请改用 ${ServerPort.MIN} 及以上端口")
+                Log.w(TAG, "bind denied on port $port", e)
+                return
+            }
             server = socket
             running = true
-            notifyState("原生 API 运行中 · 端口 $PORT（本机与局域网）")
+            notifyState("原生 API 运行中 · 端口 $port（本机与局域网）")
+            // 前台服务通知在 onCreate 里已经用"正在启动"占位，绑定成功后立刻刷新成真实端口，
+            // 否则通知栏会一直显示启动时的文案（改端口后尤其误导）。
+            runCatching {
+                (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                    .notify(NOTIFICATION_ID, notification("原生 API 运行中 · 端口 $port"))
+            }
             while (!socket.isClosed) {
                 val client = socket.accept()
                 // 线程池/队列已满时必须单独接住：否则拒绝异常会冒泡到外层 catch，
@@ -925,7 +955,9 @@ class ApiHostService : Service() {
     private class ClientError(message: String) : RuntimeException(message)
 
     companion object {
-        const val PORT = 8788
+        // 端口不再作为编译期常量：它由 ServerPort 从设置表读取（见 ServerPort.kt）。
+        // 保留一个只读 getter 供「尚未启动服务」的界面代码取当前值，
+        // 但这需要 Context，因此调用方一律走 ServerPort.current(ctx)。
         const val ACTION_STOP = "com.joy4fire.workbuddy2api.STOP"
         const val ACTION_STATE = "com.joy4fire.workbuddy2api.STATE"
         /** 看门狗闹钟动作：被它唤醒时只需确认前台服务与唤醒锁仍在。 */

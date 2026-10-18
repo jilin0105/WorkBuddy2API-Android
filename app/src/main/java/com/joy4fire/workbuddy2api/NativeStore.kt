@@ -881,6 +881,16 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
          * use_degraded_prompt）就曾因此完全无法保存。
          */
         private val DEFAULT_SETTINGS = mapOf(
+            /**
+             * 本地 API 监听端口。
+             *
+             * 为什么必须在这里登记：saveSettings() 只写入 `key in DEFAULT_SETTINGS` 的键，
+             * 未登记的新键会被静默丢弃 —— 表现为"点了保存、界面回显成功、重启后又变回默认值"。
+             *
+             * 8758 的取值理由：避开 8788（旧版固定值，用户原有配置可能仍指向它）与
+             * 8789（看门狗通知 ID / 相邻占用），同时远离 Android 常用的 8080/5555/5000。
+             */
+            "server_port" to "8758",
             "checkin_hours" to "9,21",
             "credit_refresh_min" to "30",
             "model_refresh_hour" to "6",

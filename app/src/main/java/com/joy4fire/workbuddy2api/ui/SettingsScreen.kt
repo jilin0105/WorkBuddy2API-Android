@@ -13,6 +13,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.joy4fire.workbuddy2api.ServerPort
 import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.preference.ArrowPreference
@@ -115,8 +116,26 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
         item {
             PcCard {
                 PcInfoRow("版本", installedVersion(context))
-                PcMonoRow("本地端口", "8788")
-                PcMonoRow("监听地址", "127.0.0.1（本机）")
+                // 端口不再是只读展示：改成可编辑行，并区分"保存值 / 实际监听值"。
+                // 这里不用 PcMonoRow（等宽短横条样式），因为它本质是展示型键值；
+                // 端口需要点击进入编辑，必须用可点击行。
+                PortSettingRow(
+                    saved = ServerPort.current(context),
+                    active = if (app.serviceRunning) ServerPort.current(context) else null,
+                    running = app.serviceRunning,
+                    onSave = { port ->
+                        // 通过 ServerPort 写入，保证走同一条校验与落库路径；
+                        // 写入后刷新设置状态，让行上的回显立即更新。
+                        ServerPort.set(context, port.toString())
+                        app.loadSettings()
+                        app.showMessage(
+                            if (app.serviceRunning) "端口已保存为 $port，重启服务后生效"
+                            else "端口已保存为 $port"
+                        )
+                    }
+                )
+                PcDivider()
+                PcMonoRow("监听地址", "0.0.0.0（本机与局域网）")
                 Spacer(Modifier.height(PcTokens.RowGap))
                 PcNote(
                     "本应用为本地自用网关：数据只存在本机 SQLite，不上传任何第三方服务器；" +

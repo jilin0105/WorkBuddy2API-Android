@@ -209,7 +209,7 @@ class MainActivity : Activity() {
                 // 若服务已被系统杀掉（running=false），窗口应由服务重启后自己创建，
                 // 否则服务一直起不来时，窗口会带着"运行中"的假象永久留在屏幕上。
                 if (ApiHostService.running && !FloatingWindowKeeper.isShowing()) {
-                    FloatingWindowKeeper.show(this, ApiHostService.PORT)
+                    FloatingWindowKeeper.show(this, ServerPort.current(this@MainActivity))
                 }
                 floatingStateText?.text = floatingSummary()
             }
@@ -278,11 +278,13 @@ class MainActivity : Activity() {
                     if (ApiHostService.running) R.color.wb_success else R.color.wb_on_surface_variant))
             })
             addView(caption(if (ApiHostService.running)
-                "OpenAI 兼容地址  http://127.0.0.1:${ApiHostService.PORT}/v1"
+                "OpenAI 兼容地址  " + ServerPort.baseUrl(ServerPort.current(this@MainActivity))
             else "启动后仅在本机提供 OpenAI 兼容 API。"), top(8))
             addView(row(top = 14) {
                 addView(action(if (ApiHostService.running) "停止服务" else "启动服务") { toggleServer() }, weighted())
-                addView(action("复制地址", outlined = true) { copyText("http://127.0.0.1:${ApiHostService.PORT}/v1", "Base URL") }, weighted(start = 8))
+                addView(action("复制地址", outlined = true) {
+                    copyText(ServerPort.baseUrl(ServerPort.current(this@MainActivity)), "Base URL")
+                }, weighted(start = 8))
             })
         })
         addView(section("快速概览"))
@@ -535,7 +537,7 @@ class MainActivity : Activity() {
         addView(card {
             addView(text("WorkBuddy2API", 17, true))
             addView(caption("Android 原生版 · 内置登录窗口 · 无系统浏览器跳转"), top(4))
-            addView(labelValue("本地端口", ApiHostService.PORT.toString()), top(12))
+            addView(labelValue("本地端口", ServerPort.current(this@MainActivity).toString()), top(12))
             addView(labelValue("国内后端", NativeCore.BACKEND), top(8))
             addView(labelValue("国际后端", NativeCore.INTERNATIONAL_BACKEND), top(8))
         })
@@ -611,11 +613,13 @@ class MainActivity : Activity() {
         })
         addView(section("接入配置"))
         addView(card {
-            addView(labelValue("Base URL", "http://127.0.0.1:${ApiHostService.PORT}/v1"))
+            addView(labelValue("Base URL", ServerPort.baseUrl(ServerPort.current(this@MainActivity))))
             addView(labelValue("认证请求头", "Authorization: Bearer <API_KEY>"), top(12))
             addView(labelValue("兼容请求头", "X-Api-Key: <API_KEY>"), top(12))
             addView(row(top = 14) {
-                addView(action("复制地址", outlined = true) { copyText("http://127.0.0.1:${ApiHostService.PORT}/v1", "Base URL") }, weighted())
+                addView(action("复制地址", outlined = true) {
+                    copyText(ServerPort.baseUrl(ServerPort.current(this@MainActivity)), "Base URL")
+                }, weighted())
                 addView(action("复制认证格式", outlined = true) { copyText("Authorization: Bearer <API_KEY>", "认证格式") }, weighted(start = 8))
             })
         })
@@ -1065,7 +1069,7 @@ class MainActivity : Activity() {
                     } else {
                         FloatingWindowKeeper.setEnabled(this@MainActivity, checked)
                         if (checked) {
-                            FloatingWindowKeeper.show(this@MainActivity, ApiHostService.PORT)
+                            FloatingWindowKeeper.show(this@MainActivity, ServerPort.current(this@MainActivity))
                             toast("悬浮球已开启")
                         } else {
                             FloatingWindowKeeper.hide(this@MainActivity)

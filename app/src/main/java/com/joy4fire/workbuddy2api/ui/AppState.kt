@@ -10,6 +10,7 @@ import androidx.compose.runtime.setValue
 import com.joy4fire.workbuddy2api.ApiHostService
 import com.joy4fire.workbuddy2api.FormatKit
 import com.joy4fire.workbuddy2api.NativeCore
+import com.joy4fire.workbuddy2api.ServerPort
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -565,7 +566,7 @@ class AppState(private val context: Context) {
         } else {
             keeper.setEnabled(context, enabled)
             if (enabled) {
-                if (target != null) keeper.show(target, ApiHostService.PORT)
+                if (target != null) keeper.show(target, ServerPort.current(context))
                 record("悬浮球已开启")
             } else {
                 keeper.hide(context)

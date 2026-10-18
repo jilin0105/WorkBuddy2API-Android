@@ -24,8 +24,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.joy4fire.workbuddy2api.ApiHostService
 import com.joy4fire.workbuddy2api.FormatKit
+import com.joy4fire.workbuddy2api.ServerPort
 import top.yukonga.miuix.kmp.basic.LinearProgressIndicator
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -53,6 +53,8 @@ fun OverviewScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
     val activity = LocalContext.current as? Activity
     val running = app.serviceRunning
     val starting = app.startingUp
+    // 端口可在设置页改，运行时可变：这里随重组重读，保证改完后概览页显示的地址立即跟上。
+    val currentPort = ServerPort.current(context)
     var showEvents by remember { mutableStateOf(false) }
     var showAccountDetail by remember { mutableStateOf(false) }
 
@@ -89,7 +91,7 @@ fun OverviewScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
 
                 // 地址是"要抄到别的设备上去"的东西，因此独占一行、等宽显示。
                 Text(
-                    "http://127.0.0.1:${ApiHostService.PORT}/v1",
+                    ServerPort.baseUrl(currentPort),
                     style = MiuixTheme.textStyles.body2,
                     fontFamily = FontFamily.Monospace,
                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
@@ -114,7 +116,7 @@ fun OverviewScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                             primary = true
                         ) { app.toggleServer(activity) },
                         PcAction("复制地址") {
-                            copyToClipboard(context, "http://127.0.0.1:${ApiHostService.PORT}/v1")
+                            copyToClipboard(context, ServerPort.baseUrl(currentPort))
                             app.showMessage("已复制 Base URL")
                         }
                     )

@@ -21,8 +21,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.joy4fire.workbuddy2api.AccountRegion
-import com.joy4fire.workbuddy2api.ApiHostService
 import com.joy4fire.workbuddy2api.FormatKit
+import com.joy4fire.workbuddy2api.ServerPort
 import top.yukonga.miuix.kmp.basic.TabRow
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
@@ -55,7 +55,8 @@ fun AppsScreen(context: Context, app: AppState) {
     var showKey by remember { mutableStateOf<Pair<String, String>?>(null) }
     var pendingDelete by remember { mutableStateOf<Pair<Long, String>?>(null) }
 
-    val baseUrl = "http://127.0.0.1:${ApiHostService.PORT}/v1"
+    // 端口是运行时可变的，不能缓存成常量；每次重组都从设置读当前生效值。
+    val baseUrl = ServerPort.baseUrl(ServerPort.current(context))
 
     PcList {
         // ---------------- 接入参数 ----------------
