@@ -399,6 +399,17 @@ class ApiHostService : Service() {
 
                 val raw = response.body?.string().orEmpty()
                 val code = response.code
+                // 把「上游怎么回的」也记进出网取证，便于在界面上直接看到
+                // 状态码与业务错误码（11-128 / 11158 / 11102 等），不必再抓 logcat。
+                runCatching {
+                    RequestInspector.noteResponse(
+                        this,
+                        upstream.request.url.toString(),
+                        code,
+                        safeUpstreamError(raw, code).toString(),
+                        account.uid
+                    )
+                }
                 // 失败必须落痕：此前这里直接 return，429 打完一个标记都不留，
                 // 下一个请求照样选中同一个已被限流的账号，形成限流风暴。
                 //
@@ -406,10 +417,13 @@ class ApiHostService : Service() {
                 // 不被认可」，与这个账号是否被限流无关，冷却它只会误伤正常对话——
                 // 表现为成长任务失败后，连聊天都开始报「没有可用的国际版账号」503，
                 // 60 秒后又被下一个失败请求重新冷却，形成死循环。
-                if (isChannelRejection(code, raw)) {
-                    Log.w(TAG, "channel verification rejected on ${account.uid}; skip cooldown (not an account fault)")
-                } else {
+                if (shouldCooldownAccount(code)) {
                     NativeCore.store(this).markAccountFailure(account.key, NativeCore.cooldownFor(code))
+                } else {
+                    // 4xx 里的非限流类错误（400/404/409/422/11-128 等）是「这一次请求
+                    // 本身有问题」，不代表账号不可用。冷却它只会误伤同一账号的其它正常
+                    // 请求，表现就是「成长任务失败几次后，聊天也报没有可用账号」。
+                    Log.w(TAG, "upstream $code on ${account.uid}; skip cooldown (request-level fault)")
                 }
                 if (code in RETRYABLE_STATUS && attempt == 0 && !socket.isClosed) {
                     attempt++
@@ -519,20 +533,20 @@ class ApiHostService : Service() {
     }
 
     /**
-     * 是否为「渠道校验」拒绝（400 + 11-128）。
+     * 该上游返回是否应让「账号」进入冷却。
      *
-     * 这类失败是上游网关判定「请求不是官方客户端发出的」，属于客户端身份问题，
-     * 换账号、等冷却都无效，因此**不能**据此冷却账号，否则会误伤同一账号的正常对话。
-     * 判定放宽：上游措辞不稳定，code 可能是数字或字符串，也见过 request illegal /
-     * channel verification 等表述。
+     * 原则：只有「这个账号此刻不可用/被限流」才冷却；「这次请求本身有问题」不冷却。
+     *   · 429              限流 → 冷却（300s）
+     *   · 401 / 403        凭据失效/无权限 → 冷却（1800s）
+     *   · 5xx              上游故障 → 短暂冷却（120s）
+     *   · 其余 4xx（400/404/409/422，含渠道校验 11-128）→ **不冷却**
+     *
+     * 此前是「任何失败都冷却」，导致 400/11-128 这类请求级错误把账号冻住，
+     * 正常对话跟着报「没有可用的国际版账号」，且 60 秒后又被下一个失败请求
+     * 重新冷却，形成死循环。
      */
-    private fun isChannelRejection(status: Int, raw: String): Boolean {
-        if (status != 400) return false
-        val text = raw.lowercase()
-        return text.contains("11-128") ||
-            text.contains("request illegal") ||
-            text.contains("channel verification")
-    }
+    private fun shouldCooldownAccount(status: Int): Boolean =
+        status == 429 || status == 401 || status == 403 || status >= 500
 
     private fun safeUpstreamError(raw: String, status: Int): JSONObject {
         val parsed = runCatching { JSONObject(raw) }.getOrNull()

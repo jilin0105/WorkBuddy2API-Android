@@ -200,7 +200,9 @@ object NativeCore {
      * 不必干等冷却到期。不影响 enabled 状态。
      */
     fun clearCooldowns(context: Context, accountKey: String? = null): Int =
-        store(context).clearCooldowns(accountKey)    fun authenticateApp(context: Context, key: String): JSONObject? = store(context).authenticateApp(key)
+        store(context).clearCooldowns(accountKey)
+
+    fun authenticateApp(context: Context, key: String): JSONObject? = store(context).authenticateApp(key)
 
     @Synchronized
     fun headers(context: Context): Map<String, String> = accountForRequest(context).let { headersFor(it) }
@@ -209,7 +211,8 @@ object NativeCore {
     private fun accountForRequest(context: Context, region: AccountRegion? = null): Account {
         migrateLegacy(context)
         val selected = store(context).selectAccount(region = region?.id) ?: throw IOException(
-            if (region == null) "尚未导入可用的 WorkBuddy 账号" else "没有可用的${region.label}账号"
+            if (region == null) "尚未导入可用的 WorkBuddy 账号"
+            else "没有可用的${region.label}账号（${store(context).regionStatus(region.id)}）"
         )
         var account = loadAccount(context, selected.getString("account_key")) ?: throw IOException("账号认证数据缺失")
         val expiresAt = normalizedExpiryMillis(account.auth)

@@ -125,6 +125,37 @@ object RequestInspector {
     }
 
     /**
+     * 追加一条「上游返回」记录（与出网请求记录并列，便于逐条对照）。
+     *
+     * 此前取证只存「发出去的请求」，不存「上游怎么回的」，排查时只能靠 logcat，
+     * 而移动端抓 logcat 很不方便。补上这条后，界面「出网取证」里就能直接看到
+     * 状态码与响应体（含 11-128 / 11158 / 11102 这类业务错误码）。
+     */
+    fun noteResponse(
+        context: Context,
+        endpoint: String,
+        status: Int,
+        body: String,
+        accountKey: String = ""
+    ) {
+        if (!isEnabled(context)) return
+
+        val entry = JSONObject()
+        entry.put("ts", System.currentTimeMillis())
+        entry.put("method", "RESP $status")
+        entry.put("url", endpoint)
+        entry.put("account", accountKey)
+        entry.put("headers", JSONObject())
+        entry.put("body", body.take(2000))
+
+        val arr = readEntries(context)
+        val next = org.json.JSONArray()
+        next.put(entry)
+        for (i in 0 until minOf(arr.length(), MAX_ENTRIES - 1)) next.put(arr.get(i))
+        prefs(context).edit().putString(KEY_ENTRIES, next.toString()).apply()
+    }
+
+    /**
      * 保形脱敏：保留前后各 6 个字符与总长度，中间打码。
      *
      * 保留长度是有意的——「Bearer + JWT」的总长度本身就是格式特征，

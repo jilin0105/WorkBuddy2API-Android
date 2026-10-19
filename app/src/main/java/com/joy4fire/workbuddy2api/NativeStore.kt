@@ -290,7 +290,8 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         cleared
     }
 
-    /** token 保活连续失败阈值：对齐上游 scheduler._keepalive_fail_threshold = 3。 */    private val KEEPALIVE_FAIL_THRESHOLD = 3
+    /** token 保活连续失败阈值：对齐上游 scheduler._keepalive_fail_threshold = 3。 */
+    private val KEEPALIVE_FAIL_THRESHOLD = 3
 
     /**
      * 记录一次 token 刷新失败。
@@ -436,6 +437,43 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
     /** 最小间隔的随机抖动幅度（秒）：对齐上游 ratelimit.py 默认 ±0.3s。 */
     private val RATELIMIT_JITTER = 0.3
 
+    /**
+     * 诊断某个版本下的账号分布，用于把「没有可用的 XX 账号」讲清楚。
+     *
+     * 原来只回一句「没有可用的国际版账号」，用户看到 3 个账号却不知道是冷却、
+     * 额度耗尽还是被停用，只能猜。这里把各类计数直接拼进错误信息。
+     */
+    fun regionStatus(region: String?): String = synchronized(lock) {
+        val now = nowSeconds()
+        val regionClause = if (region.isNullOrBlank()) "" else " AND region=?"
+        val args = if (region.isNullOrBlank()) null else arrayOf(region)
+        var total = 0; var disabled = 0; var cooling = 0; var noCredits = 0; var ready = 0
+        var soonest = -1.0
+        readableDatabase.rawQuery("SELECT * FROM accounts WHERE 1=1$regionClause", args).use { c ->
+            while (c.moveToNext()) {
+                total++
+                val item = accountJson(c)
+                if (!item.optBoolean("enabled", true)) { disabled++; continue }
+                val hasCredits = item.isNull("credits_remaining") || item.optDouble("credits_remaining") > 0
+                if (!hasCredits) { noCredits++; continue }
+                val cd = item.optDouble("cooldown_until", 0.0)
+                if (cd > now) {
+                    cooling++
+                    val left = cd - now
+                    if (soonest < 0 || left < soonest) soonest = left
+                } else {
+                    ready++
+                }
+            }
+        }
+        val parts = mutableListOf("共 $total 个")
+        if (ready > 0) parts += "$ready 个可用"
+        if (cooling > 0) parts += "$cooling 个冷却中（最早 ${soonest.toInt()} 秒后到期）"
+        if (noCredits > 0) parts += "$noCredits 个额度为 0"
+        if (disabled > 0) parts += "$disabled 个已停用"
+        parts.joinToString("，")
+    }
+
     /** Weighted selection with hard priority for credits expiring within seven days. */
     fun selectAccount(markUsed: Boolean = true, region: String? = null): JSONObject? = synchronized(lock) {
         val now = nowSeconds()
@@ -454,7 +492,14 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
             // 冷却兜底：无健康账号时退回「最早冷却到期」的账号顶班，但它若还要冷却
             // 超过 30s 就绝不硬打——打上去只会再吃一个 429，形成限流风暴。
             // 上游实测事故记录见 CODE_REVIEW_TODO.md:195（单账号场景 fallback 反复选中同一账号）。
-            readableDatabase.rawQuery("SELECT * FROM accounts WHERE enabled=1$regionClause ORDER BY cooldown_until ASC LIMIT 1", regionArgs).use { c ->
+            // 兜底同样要排除「额度为 0」的账号：没额度的号打上去必然失败，
+            // 选中它等于把 503 换成另一个错误，还白白消耗一次风控计数。
+            readableDatabase.rawQuery(
+                "SELECT * FROM accounts WHERE enabled=1$regionClause" +
+                    " AND (credits_remaining IS NULL OR credits_remaining > 0)" +
+                    " ORDER BY cooldown_until ASC LIMIT 1",
+                regionArgs
+            ).use { c ->
                 if (c.moveToFirst()) {
                     val fallback = accountJson(c)
                     if (fallback.optDouble("cooldown_until") - now > COOLDOWN_FALLBACK_MAX_WAIT) {
