@@ -1,10 +1,10 @@
 name: Build APK
 
 # 触发条件：
-#   · push 到 main（自动打包最新版本，滚动更新 Release）
-#   · 打 v* 标签（产出独立 Release）
-#   · 手动触发（Actions 页面 Run workflow）
-#   · PR 只做编译校验，不产出 Release
+#   · push 到 main —— 自动打包最新版本，滚动更新 latest-build Release
+#   · 打 v* 标签 —— 产出独立 Release
+#   · 手动触发   —— Actions 页面 Run workflow（可对任意分支出包）
+#   · PR         —— 只做编译校验，不产出 Release
 on:
   push:
     branches: [ main ]
@@ -14,22 +14,29 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write          # 发布 Release 必需；fork 仓库需在 Settings 改为 Read and write
 
 concurrency:
-  # 同一分支只保留最新一次构建：连续 push 时避免多个构建抢占缓存与 Release
-  group: build-${{ github.ref }}
+  # 所有触发源共用同一 group：tag 与 branch 同时推送时不互抢 latest-build
+  group: build-apk
   cancel-in-progress: true
+
+env:
+  # CI 与 gradle 配置的唯一真源，避免 body / sdkmanager / compileSdk 三处漂移
+  COMPILE_SDK: android-37.0
+  BUILD_TOOLS: "36.0.0"
 
 jobs:
   build:
-    name: Assemble debug APK
+    name: Assemble APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # 浅克隆会导致 action-gh-release 创建 latest-build tag 失败
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -39,21 +46,16 @@ jobs:
 
       - name: Set up Android SDK
         run: |
-          # 这里刻意不用 set -e：探测 sdkmanager 的过程中允许部分命令失败
-          # （例如某个候选路径不存在），失败信息只作为诊断线索保留。
+          # 刻意不用 set -e：探测 sdkmanager 的过程中允许候选路径不存在，失败仅作诊断线索。
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "SDK 根目录：$SDK_ROOT"
           echo "--- cmdline-tools 布局 ---"
           ls -la "$SDK_ROOT/cmdline-tools" || true
 
-          # 探测顺序（runner 镜像版本不同，布局会有差异）：
-          #   1) cmdline-tools/latest/bin/sdkmanager（官方推荐位置）
-          #   2) cmdline-tools/<任意版本>/bin/sdkmanager
-          #   3) 任意名为 sdkmanager 的可执行文件
           SDKMANAGER=""
           for candidate in \
             "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-            "$SDK_ROOT/cmdline-tools"/*/bin/sdkmanager \
+            "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager \
             "$SDK_ROOT/tools/bin/sdkmanager"; do
             if [ -x "$candidate" ]; then SDKMANAGER="$candidate"; break; fi
           done
@@ -61,7 +63,8 @@ jobs:
             SDKMANAGER=$(find "$SDK_ROOT" -name sdkmanager -type f 2>/dev/null | head -1)
           fi
           if [ -z "$SDKMANAGER" ]; then
-            echo "未找到 sdkmanager，尝试用 sdkmanager 命令自身"; SDKMANAGER="sdkmanager"
+            echo "未找到 sdkmanager，回退到 PATH 中的 sdkmanager"
+            SDKMANAGER="sdkmanager"
           fi
           echo "sdkmanager：$SDKMANAGER"
 
@@ -70,19 +73,16 @@ jobs:
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
           echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
 
-      - name: Install platform android-37.0 (preview channel)
+      - name: Install platform and build-tools
         run: |
           set -e
-          # 本仓库 compileSdk 为 "android-37.0"：
-          #   · 它位于 Google 的 预览（preview）channel，不在稳定 channel 中 ——
-          #     稳定 channel 最高只到 android-36，直接装 "platforms;android-37" 会失败；
-          #   · 因此必须用 --channel=3（preview）安装同名包 "platforms;android-37.0"；
-          #   · 另外 Miuix 0.9.1 的 AAR 元数据硬性要求 compileSdk >= 37
-          #     （降到 36 会被 checkDebugAarMetadata 直接拒绝），故不能降版本绕过。
+          # android-37.0 位于 Google 预览 channel（--channel=3），稳定 channel 最高只到 android-36。
+          # Miuix 0.9.1 的 AAR 元数据硬性要求 compileSdk >= 37，不能降版本绕过。
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" --channel=3 "platforms;android-37.0" "build-tools;36.0.0" "platform-tools"
+          "$SDKMANAGER" --channel=3 "platforms;${COMPILE_SDK}" "build-tools;${BUILD_TOOLS}" "platform-tools"
           echo "--- 已安装平台 ---"
           ls "${ANDROID_SDK_ROOT}/platforms"
+          echo "--- 已安装 build-tools ---"
           ls "${ANDROID_SDK_ROOT}/build-tools"
 
       - name: Cache Gradle
@@ -91,12 +91,13 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
-          restore-keys: gradle-${{ runner.os }}-
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties', 'gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
       - name: Write local.properties
         run: |
-          # local.properties 被 .gitignore 排除（它记录本机 SDK 绝对路径），CI 需自行生成。
+          # local.properties 记录本机 SDK 绝对路径，被 .gitignore 排除，CI 需自行生成
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "sdk.dir=$SDK_ROOT" > local.properties
           cat local.properties
@@ -105,69 +106,78 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Collect APK info
+      - name: Build release APK
+        if: github.event_name != 'pull_request'
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
         id: apk
         run: |
           set -e
-          APK=$(find app/build/outputs/apk/debug -name '*.apk' | head -1)
-          [ -n "$APK" ] || { echo "未找到 APK 产物"; exit 1; }
-          echo "path=$APK" >> "$GITHUB_OUTPUT"
-          echo "size=$(du -h "$APK" | cut -f1)" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          # debug / release 两个变体都收集，文件名带变体前缀便于区分
+          for variant in debug release; do
+            d="app/build/outputs/apk/$variant"
+            [ -d "$d" ] || continue
+            for f in "$d"/*.apk; do
+              [ -e "$f" ] || continue
+              cp "$f" "out/${variant}-$(basename "$f")"
+            done
+          done
+          count=$(ls -1 out/*.apk 2>/dev/null | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "未找到任何 APK 产物，列出实际输出目录："
+            find app/build/outputs -type f 2>/dev/null || true
+            exit 1
+          fi
+          echo "共收集 $count 个 APK："
+          ls -lh out
+          # 主产物优先 release（R8 优化后体积更小），没有则退回 debug
+          main_apk=$(ls -1 out/release-*.apk 2>/dev/null | head -1 || true)
+          [ -n "$main_apk" ] || main_apk=$(ls -1 out/*.apk | head -1)
+          echo "main=$main_apk" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$main_apk" | cut -f1)" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          ls -la "$APK"
+          version=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1 || echo unknown)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "主产物：$main_apk（版本 $version）"
 
-      - name: Upload APK as artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-${{ github.sha }}
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 14
+          name: apk-${{ github.sha }}
+          path: out/*.apk
+          retention-days: 30
+          if-no-files-found: error     # 路径不匹配立刻红，杜绝静默空包
 
-      - name: Rename APK
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-        run: |
-          set -e
-          mkdir -p release-out
-          cp "${{ steps.apk.outputs.path }}" "release-out/WorkBuddy2API-${{ steps.apk.outputs.sha }}.apk"
-          ls -la release-out/
-
-      - name: Delete previous release assets
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # 滚动 Release 若不清理，资产会不断累积（每次构建都新增一个 APK），
-          # 下载页就会出现多个版本、用户容易拿到旧的。
-          # 这里在发布前删掉该 tag 下已有的全部资产，保证只保留本次构建的 APK。
-          existing=$(gh release view latest-build --json assets --jq '.assets[].name' 2>/dev/null || true)
-          for name in $existing; do
-            echo "删除旧资产：$name"
-            gh release delete-asset latest-build "$name" --yes 2>/dev/null || true
-          done
-
-      - name: Publish rolling release (latest-build)
+      - name: Publish rolling release
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          # 固定 tag 做滚动更新：让它始终只有一个入口，
-          # 不会随着提交数增长堆出一长串历史 Release。
+          # 固定 tag 做滚动更新：始终一个入口，不随提交数堆历史 Release。
+          # tag 由 action 自动创建；overwrite_files 负责覆盖同名资产，无需手工删。
           tag_name: latest-build
           name: 最新构建（latest-build）
           body: |
-            自动构建产出的 debug APK。
+            自动构建产出的 APK。
 
             | 项 | 值 |
             | --- | --- |
+            | 版本 | ${{ steps.apk.outputs.version }} |
             | 提交 | `${{ github.sha }}` |
             | 分支 | `main` |
-            | APK 大小 | ${{ steps.apk.outputs.size }} |
-            | compileSdk | android-36（CI 覆盖，仓库默认 37.0，见 build.gradle.kts） |
+            | 主产物 | `${{ steps.apk.outputs.main }}` |
+            | 体积 | ${{ steps.apk.outputs.size }} |
+            | compileSdk | ${{ env.COMPILE_SDK }} |
+            | build-tools | ${{ env.BUILD_TOOLS }} |
 
-            > 使用 debug 签名。本仓库为本地自用网关工具，不发布应用商店。
+            > debug 与 release 两套都附在本 Release 中，release 变体复用 debug 签名。
             > 安装前请先卸载设备上的旧版本，或确认签名一致。
-          files: release-out/*.apk
+          files: out/*.apk
+          fail_on_unmatched_files: true
+          overwrite_files: true
           make_latest: true
 
       - name: Publish tag release
@@ -178,7 +188,10 @@ jobs:
           body: |
             标签 `${{ github.ref_name }}` 的构建产物。
 
+            - 版本：${{ steps.apk.outputs.version }}
             - 提交：`${{ github.sha }}`
-            - APK 大小：${{ steps.apk.outputs.size }}
-          files: release-out/*.apk
+            - 主产物：`${{ steps.apk.outputs.main }}`
+            - 体积：${{ steps.apk.outputs.size }}
+          files: out/*.apk
+          fail_on_unmatched_files: true
           generate_release_notes: true
