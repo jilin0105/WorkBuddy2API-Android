@@ -1,0 +1,141 @@
+[
+  {
+    "id": "claude-3.7",
+    "name": "Claude-3.7-Sonnet",
+    "vendor": "e",
+    "maxOutputTokens": 8192,
+    "maxInputTokens": 200000,
+    "supportsToolCall": true,
+    "supportsImages": true,
+    "maxAllowedSize": 40000,
+    "credits": "x0.1 credits"
+  },
+  {
+    "id": "claude-4.0",
+    "name": "Claude-4.0-Sonnet",
+    "vendor": "e",
+    "maxOutputTokens": 24000,
+    "maxInputTokens": 200000,
+    "supportsToolCall": true,
+    "supportsImages": true,
+    "maxAllowedSize": 40000
+  },
+  {
+    "id": "gpt-5",
+    "name": "GPT-5",
+    "vendor": "e",
+    "maxOutputTokens": 128000,
+    "maxInputTokens": 272000,
+    "supportsToolCall": true,
+    "supportsImages": true,
+    "maxAllowedSize": 80000
+  },
+  {
+    "id": "gpt-5-mini",
+    "name": "GPT-5-mini",
+    "vendor": "e",
+    "maxOutputTokens": 128000,
+    "maxInputTokens": 272000,
+    "supportsToolCall": true,
+    "supportsImages": true,
+    "maxAllowedSize": 80000
+  },
+  {
+    "id": "gpt-5-nano",
+    "name": "GPT-5-nano",
+    "vendor": "e",
+    "maxOutputTokens": 128000,
+    "maxInputTokens": 272000,
+    "supportsToolCall": true,
+    "supportsImages": true,
+    "maxAllowedSize": 80000
+  },
+  {
+    "id": "o4-mini",
+    "name": "GPT-4o-mini",
+    "vendor": "e",
+    "maxOutputTokens": 32000,
+    "maxInputTokens": 200000,
+    "supportsToolCall": true,
+    "supportsImages": true,
+    "maxAllowedSize": 40000
+  },
+  {
+    "id": "gemini-2.5-flash",
+    "name": "Gemini-2.5-Flash",
+    "maxOutputTokens": 16384,
+    "maxInputTokens": 1000000,
+    "supportsToolCall": true,
+    "supportsImages": true,
+    "maxAllowedSize": 40000
+  },
+  {
+    "id": "gemini-2.5-pro",
+    "name": "Gemini-2.5-Pro",
+    "maxOutputTokens": 16384,
+    "maxInputTokens": 1000000,
+    "supportsToolCall": true,
+    "supportsImages": true,
+    "maxAllowedSize": 40000
+  },
+  {
+    "id": "deepseek-v4-flash",
+    "name": "deepseek-v4-flash",
+    "vendor": "f",
+    "maxOutputTokens": 128000,
+    "maxInputTokens": 1000000,
+    "supportsToolCall": true,
+    "supportsImages": false,
+    "disabledMultimodal": true
+  },
+  {
+    "id": "completion-gf",
+    "name": "completion-gf",
+    "vendor": "j",
+    "maxOutputTokens": 8192,
+    "maxInputTokens": 200000,
+    "supportsToolCall": true,
+    "supportsImages": false,
+    "disabledMultimodal": true
+  },
+  {
+    "id": "hy3",
+    "name": "hy3",
+    "vendor": "j",
+    "maxOutputTokens": 64000,
+    "maxInputTokens": 192000,
+    "supportsToolCall": true,
+    "supportsImages": false,
+    "disabledMultimodal": true
+  },
+  {
+    "id": "default-1.1",
+    "name": "Claude-3.7-Sonnet",
+    "vendor": "e",
+    "maxOutputTokens": 8192,
+    "supportsToolCall": true,
+    "supportsImages": true
+  },
+  {
+    "id": "hunyuan-3b",
+    "name": "hunyuan-3b",
+    "vendor": "tencent",
+    "maxOutputTokens": 256,
+    "supportsExtra": true
+  },
+  {
+    "id": "hunyuan-7b-dense",
+    "name": "hunyuan-7b",
+    "vendor": "tencent",
+    "maxOutputTokens": 256,
+    "supportsExtra": true
+  },
+  {
+    "id": "default-1.2",
+    "name": "Claude-4.0-Sonnet",
+    "vendor": "e",
+    "maxOutputTokens": 8192,
+    "supportsToolCall": true,
+    "supportsImages": true
+  }
+]
