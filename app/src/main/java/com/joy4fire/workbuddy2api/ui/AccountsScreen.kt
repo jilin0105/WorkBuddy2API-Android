@@ -221,7 +221,16 @@ fun AccountsScreen(context: Context, app: AppState) {
                                 primary = true,
                                 enabled = !app.busy
                             ) { app.refreshCredits() },
-                            PcAction("全部国内账号签到", enabled = !app.busy) { app.checkInAll() }
+                            PcAction("全部国内账号签到", enabled = !app.busy) { app.checkInAll() },
+                            PcAction("清除账号冷却", enabled = !app.busy) {
+                                // 冷却原先只能等自然过期，遇到「没有可用的国际版账号」503 时
+                                // 用户无法自救。这里给一个主动恢复入口。
+                                val n = NativeCore.clearCooldowns(context)
+                                app.showMessage(
+                                    if (n > 0) "已清除 $n 个账号的冷却，可立即使用"
+                                    else "当前没有账号处于冷却状态"
+                                )
+                            }
                         )
                     )
                     Spacer(Modifier.height(PcTokens.SectionGap))

@@ -1,6 +1,11 @@
 package com.joy4fire.workbuddy2api
 
+import android.content.ContentValues
 import android.content.Context
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -85,6 +90,28 @@ class GrowthApi(context: Context) {
     private fun desktopUa(id: Identity): String {
         val product = if (id.region == AccountRegion.INTERNATIONAL) "WorkBuddy AI" else "WorkBuddy"
         return "WorkBuddy/5.5.4 $product/5.5.4 CLI/2.137.1"
+    }
+
+    /**
+     * CLI 身份请求头（用于 /v2/chat/completions 这类对话接口）。
+     *
+     * 与 [headers] 的区别只在身份标识：UA 与 X-IDE-* 取 CLI 而非 WorkBuddy。
+     * 依据：抓包实测官方 CLI 调对话接口时发的是
+     *   User-Agent: CLI/2.169.0 CodeBuddy/2.169.0
+     *   X-Product: SaaS, X-IDE-Type/Name: CLI, X-IDE-Version: 2.169.0
+     * 而桌面版 WorkBuddy 身份调同一接口会被渠道校验拒绝（400/11128）。
+     */
+    private fun headersForCli(id: Identity): MutableMap<String, String> {
+        val headers = headers(id)
+        headers["User-Agent"] = ClientIdentity.CLI_UA
+        headers["X-Product"] = "SaaS"
+        headers["X-Product-Version"] = ClientIdentity.CLI_VERSION
+        headers["X-IDE-Type"] = "CLI"
+        headers["X-IDE-Name"] = "CLI"
+        headers["X-IDE-Version"] = ClientIdentity.CLI_VERSION
+        headers["x-codebuddy-request"] = "1"
+        ClientIdentity.stainlessHeaders().forEach { (k, v) -> headers[k] = v }
+        return headers
     }
 
     // ---------------------------------------------------------------- 基础请求
@@ -213,7 +240,9 @@ class GrowthApi(context: Context) {
     private fun reportHeaders(id: Identity) = headers(id).apply {
         this["Content-Type"] = "application/json;charset=UTF-8"
         this["Accept"] = "application/json, text/plain, */*"
-        this["User-Agent"] = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+        // 用 desktopUa 而不是硬编码字符串：国际版产品名是 "WorkBuddy AI"，
+        // 写死 "WorkBuddy" 会让国际版账号带着国内版产品名出网，本身就是渠道校验的破绽。
+        this["User-Agent"] = desktopUa(id)
         this["X-Request-ID"] = machineId(id.uid, "req") + (System.nanoTime() % 1_000_000)
     }
 
@@ -255,6 +284,36 @@ class GrowthApi(context: Context) {
     fun appContextCompat(): Context = appContext
 
     /**
+     * 把诊断文本写到 /sdcard/Download/growth_diag.txt，供外部读取。
+     *
+     * 为什么走 MediaStore 而不是直接 File 写：targetSdk 36 下分区存储禁止应用直接写
+     * Download 目录；MediaStore 是唯一免权限的合法通道。
+     * 为什么需要它：Shizuku 侧 logcat 的 tag/keyword/package 过滤在本机全部失效，
+     * 桥接又依赖无线 ADB，拿不到 App 日志。写文件是最可靠的旁路。
+     */
+    private fun dumpDiag(text: String) {
+        runCatching {
+            if (Build.VERSION.SDK_INT < 29) return
+            val resolver = appContext.contentResolver
+            val name = "growth_diag.txt"
+            // 先删同名旧文件，避免 MediaStore 自动改名成 growth_diag (1).txt
+            runCatching {
+                resolver.delete(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    "${MediaStore.MediaColumns.DISPLAY_NAME} = ?", arrayOf(name)
+                )
+            }
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            }
+            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
+            resolver.openOutputStream(uri)?.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+        }.onFailure { Log.w(TAG_DIAG, "dumpDiag failed", it) }
+    }
+
+    /**
      * SSE 流式请求，返回服务端下发的 requestId（1.2.7 `a.n2.o` 的核心）。
      *
      * 为什么要单独一个方法：普通 [callUrl] 假设响应是 JSON，而这条路径返回
@@ -266,22 +325,55 @@ class GrowthApi(context: Context) {
      */
     fun pluginStream(accountKey: String, path: String, body: JSONObject, extraHeaders: Map<String, String> = emptyMap()): String? {
         val id = identity(accountKey)
-        val headers = headers(id).apply {
+        // 用 CLI 身份，不是桌面身份。
+        //
+        // 【为什么改】原来这里发的是 X-IDE-Type/Name = WorkBuddy + WorkBuddy/5.5.x 的 UA，
+        // 即「伪装成桌面版去调 /v2/chat/completions」。实测（2026-10-19）该组合必被
+        // 渠道校验拦下：400/11128 request illegal。官方桌面版从不以 WorkBuddy 身份
+        // 调这个对话接口——它对对话接口用的是 CLI 身份（见 CodeBuddy.app 抓包）。
+        // 真正能过校验的是 CLI 身份 + channelVerifyHeaders 那套完整头。
+        val headers = headersForCli(id).apply {
             this["Accept"] = "text/event-stream"
-            this["User-Agent"] = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
-            this["X-Product"] = "SaaS"
-            this["X-IDE-Name"] = "WorkBuddy"
-            this["X-IDE-Type"] = "WorkBuddy"
-            this["X-IDE-Version"] = "5.5.6"
-            this["x-codebuddy-request"] = "1"
+            putAll(ClientIdentity.channelVerifyHeaders(
+                conversationId = UUID.randomUUID().toString(),
+                messageId = UUID.randomUUID().toString().replace("-", ""),
+                conversationRequestId = UUID.randomUUID().toString().replace("-", "")
+            ))
             putAll(extraHeaders)
         }
         val builder = Request.Builder().url(id.region.backend + path)
         headers.forEach { (k, v) -> if (v.isNotEmpty()) builder.header(k, v) }
         val request = builder.post(body.toString().toRequestBody(JSON)).build()
+        // 【诊断】把实际要发出的内容打到 logcat（token 脱敏），用于排查 11-128：
+        // 只有拿到 App 真实发出的 URL / 头 / 体，才能和 curl 成功样本逐字比对。
+        val dump = headers.entries.joinToString("; ") { (k, v) ->
+            when {
+                k.equals("Authorization", true) -> "$k=Bearer***(${v.length})"
+                else -> "$k=$v"
+            }
+        }
+        Log.i(TAG_DIAG, "REQ ${request.url} | HEADERS[$dump] | BODY=${body.toString().take(400)}")
+        dumpDiag(
+            "== 请求 ==\nURL: ${request.url}\n" +
+                "请求头(${headers.size}):\n" + headers.entries.joinToString("\n") { (k, v) ->
+                    "  $k: " + if (k.equals("Authorization", true)) "Bearer***(${v.length})" else v
+                } +
+                "\n\n请求体:\n${body}\n"
+        )
         NativeCore.http.newCall(request).execute().use { response ->
+            Log.i(TAG_DIAG, "RESP ${response.code} protocol=${response.protocol} msg=${response.message}")
             if (!response.isSuccessful) {
-                throw IOException("桌面指纹对话失败 HTTP ${response.code}：${response.body?.string()?.take(160).orEmpty()}")
+                val errBody = response.body?.string().orEmpty()
+                Log.w(TAG_DIAG, "ERRBODY ${errBody.take(500)}")
+                dumpDiag(
+                    "== 请求 ==\nURL: ${request.url}\n" +
+                        "请求头(${headers.size}):\n" + headers.entries.joinToString("\n") { (k, v) ->
+                            "  $k: " + if (k.equals("Authorization", true)) "Bearer***(${v.length})" else v
+                        } +
+                        "\n\n请求体:\n${body}\n\n== 响应 ==\nHTTP ${response.code} " +
+                        "protocol=${response.protocol}\n$errBody\n"
+                )
+                throw IOException("桌面指纹对话失败 HTTP ${response.code}：${errBody.take(160)}")
             }
             val source = response.body?.source() ?: throw IOException("桌面指纹对话响应为空")
             val buffer = StringBuilder()
@@ -332,6 +424,9 @@ class GrowthApi(context: Context) {
     fun hasAccount(): Boolean = store.accountKeys().isNotEmpty()
 
     companion object {
+        /** 诊断日志 TAG：排查上游拒绝（11-128 等）时按此过滤 logcat。 */
+        private const val TAG_DIAG = "GrowthDiag"
+
         /** 成长中心 / 开学季的网页域（1.2.7 `a.C0045h2.j` 等处的硬编码域）。 */
         const val WEB_ORIGIN = "https://www.workbuddy.cn"
 

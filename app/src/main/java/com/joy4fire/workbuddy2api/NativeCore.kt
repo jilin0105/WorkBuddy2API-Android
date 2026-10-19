@@ -192,7 +192,15 @@ object NativeCore {
     fun setAppEnabled(context: Context, appId: Long, enabled: Boolean): Boolean = store(context).setAppEnabled(appId, enabled)
     fun toggleApp(context: Context, appId: Long): Boolean? = store(context).toggleApp(appId)
     fun deleteApp(context: Context, appId: Long): Boolean = store(context).deleteApp(appId)
-    fun authenticateApp(context: Context, key: String): JSONObject? = store(context).authenticateApp(key)
+
+    /**
+     * 清除账号冷却，返回实际清理的账号数。
+     *
+     * 用于「账号」页的手动恢复入口：账号因限流/网络抖动被冷却后，用户可立即恢复，
+     * 不必干等冷却到期。不影响 enabled 状态。
+     */
+    fun clearCooldowns(context: Context, accountKey: String? = null): Int =
+        store(context).clearCooldowns(accountKey)    fun authenticateApp(context: Context, key: String): JSONObject? = store(context).authenticateApp(key)
 
     @Synchronized
     fun headers(context: Context): Map<String, String> = accountForRequest(context).let { headersFor(it) }
@@ -246,6 +254,16 @@ object NativeCore {
             // 官方 CLI 的对话请求是 OpenAI Node SDK 发出的，SDK 会自动注入
             // X-Stainless-* 指纹头；缺了这组头，「自称 CLI 却无 SDK 指纹」本身就是破绽。
             putAll(ClientIdentity.stainlessHeaders())
+            // 渠道校验头：上游对 /v2/chat/completions 增加 channel verification，
+            // 缺这组头会返回 400/11128「request illegal」。
+            // 抓包实证见 ClientIdentity.channelVerifyHeaders 注释。
+            putAll(
+                ClientIdentity.channelVerifyHeaders(
+                    conversationId = session.conversationId,
+                    messageId = messageId,
+                    conversationRequestId = SessionTracker.newMessageId()
+                )
+            )
         }
     }
 
@@ -1070,8 +1088,41 @@ object NativeCore {
         ?: data.optJSONObject("data")?.optJSONArray("Accounts") ?: data.optJSONArray("Accounts") ?: JSONArray()
     private fun noAuthHeaders(region: AccountRegion) = ClientIdentity.noAuthHeaders(region)
     private fun unwrap(root: JSONObject): JSONObject {
-        if (root.has("code") && root.optInt("code", -1) != 0) throw IOException(root.optString("msg", root.optString("message", "上游请求失败")))
+        if (root.has("code") && root.optInt("code", -1) != 0) {
+            val code = root.optInt("code", -1)
+            val rawMsg = root.optString("msg", root.optString("message", "上游请求失败"))
+            throw IOException(friendlyUpstreamError(code, rawMsg))
+        }
         return root.optJSONObject("data")?.optJSONObject("data") ?: root.optJSONObject("data") ?: root
+    }
+
+    /**
+     * 把上游错误码翻译成用户能看懂的话，同时保留原始码便于排查。
+     *
+     * 为什么要做这层：上游错误是英文 JSON（如 "model [gpt-5.5] is not allowed for
+     * user type [personal_free_user]"），直接抛给用户既看不懂也不知道该怎么办。
+     * 这几种是实测反复出现、且有明确处置方式的：
+     *   11158 - 账号等级不足（免费用户调付费模型）→ 换模型或升级账号
+     *   11102 - 该模型当前无服务路由（部署未就绪 / 已下线）→ 换模型
+     *   14003 / 429 - 限流 → 稍后重试
+     *   11128 - 渠道校验未通过 → 客户端身份问题，非用户操作可解
+     */
+    private fun friendlyUpstreamError(code: Int, rawMsg: String): String = when {
+        code == 11158 || rawMsg.contains("is not allowed for user type") -> {
+            val model = Regex("model \\[([^\\]]+)\\]").find(rawMsg)?.groupValues?.get(1).orEmpty()
+            val userType = Regex("user type \\[([^\\]]+)\\]").find(rawMsg)?.groupValues?.get(1).orEmpty()
+            val who = if (userType.contains("free", true)) "当前账号为免费用户" else "当前账号等级不支持"
+            "模型 ${model.ifBlank { "所选模型" }} 不可用：$who，该模型需要更高等级的账号。请换用其它模型。"
+        }
+        code == 11102 || rawMsg.contains("service info not found") -> {
+            val model = Regex("model \\[([^\\]]+)\\]").find(rawMsg)?.groupValues?.get(1).orEmpty()
+            "模型 ${model.ifBlank { "所选模型" }} 当前无可用服务（上游未开放或已下线），请换用其它模型。"
+        }
+        code == 14003 || code == 429 || rawMsg.contains("too many requests", true) ->
+            "请求过于频繁，已触发上游限流。请稍等 1–2 分钟再试。"
+        code == 11128 || rawMsg.contains("request illegal", true) ->
+            "上游拒绝了本次请求的客户端身份（渠道校验未通过）。这通常不是操作问题，请更新到最新版本后重试。"
+        else -> rawMsg
     }
     private fun migrateLegacy(context: Context) {
         val prefs = context.getSharedPreferences("native", Context.MODE_PRIVATE)

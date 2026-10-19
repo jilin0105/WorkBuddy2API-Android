@@ -69,6 +69,65 @@ class GrowthRunner(
     // ================================================================ 编排入口
 
     /**
+     * 一键执行：遍历【所有】账号。
+     *
+     * 【为什么需要它】旧实现 `runAll(accountKey)` 只接受单个账号，而界面传的是
+     * 「账号」页当前选中的那个（`app.selectedAccount`），于是：
+     *   · 只有列表第一个账号会被执行；
+     *   · 若第一个恰好是国际版，就永远只跑国际版 —— 而国际版的活动服务未开放
+     *     （实测 /v2/activity/banner 返回 12302 activity is offline，
+     *     /billing/meter/checkin-status 直接 404），必然全部失败，
+     *     表现为「一键完成任务永远是报错」。
+     *
+     * 现在按账号逐个执行：单账号失败不影响其它账号，结果行统一带账号标识，
+     * 用户能看出是哪个号完成的、哪个号不具备条件。
+     */
+    fun runAllForAccounts(
+        accountKeys: List<String>,
+        blocks: GrowthTasks.Reporter,
+        only: Set<String>? = null
+    ): JSONArray {
+        val merged = JSONArray()
+        for (key in accountKeys) {
+            val account = runCatching { NativeCore.loadAccount(api.appContextCompat(), key) }.getOrNull()
+            val label = account?.uid?.takeIf { it.isNotBlank() } ?: key
+            // 国际版活动服务未开放：实测 /v2/activity/banner 返回 12302 activity is offline，
+            // /billing/meter/checkin-status 直接 404，/v2/activity/growth/buddy/info 只有 buddy:null。
+            // 硬跑只会拿到 400/11-128「request illegal」，既浪费配额又加深上游风控标记，
+            // 所以直接跳过并在结果里说明原因。
+            if (account?.region == AccountRegion.INTERNATIONAL) {
+                merged.put(
+                    JSONObject()
+                        .put("account", label)
+                        .put("task_code", "(已跳过)")
+                        .put("status", "skipped")
+                        .put("message", "国际版无成长活动（上游 activity is offline），已跳过")
+                )
+                continue
+            }
+            blocks.report("账号 ${label.take(8)}…")
+            runCatching { runAll(key, blocks, only) }
+                .onSuccess { arr ->
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        merged.put(JSONObject(o.toString()).put("account", label))
+                    }
+                }
+                .onFailure { e ->
+                    merged.put(
+                        JSONObject()
+                            .put("account", label)
+                            .put("task_code", "(账号)")
+                            .put("status", "error")
+                            .put("message", "执行失败：${e.message}")
+                    )
+                }
+            api.sleep(1200)
+        }
+        return merged
+    }
+
+    /**
      * 一键执行全部任务。
      *
      * 【为什么改成遍历上游任务，而不是遍历 handlers 码表】

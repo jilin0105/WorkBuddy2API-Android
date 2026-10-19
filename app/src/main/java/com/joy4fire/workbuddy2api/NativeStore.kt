@@ -259,8 +259,38 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
         })
     }
 
-    /** token 保活连续失败阈值：对齐上游 scheduler._keepalive_fail_threshold = 3。 */
-    private val KEEPALIVE_FAIL_THRESHOLD = 3
+    /**
+     * 清除账号冷却（手动恢复入口）。
+     *
+     * 为什么需要：冷却只能靠时间自然过期，界面上此前没有任何主动恢复手段，
+     * 用户遇到「没有可用的国际版账号」503 时只能干等。
+     *
+     * 只清 cooldown_until 与 failure_count，**不动 enabled** —— 被用户主动停用的
+     * 账号不应因为「清冷却」被意外启用。
+     *
+     * @param accountKey 为空时清除全部账号的冷却
+     * @return 实际清理的账号数
+     */
+    fun clearCooldowns(accountKey: String? = null): Int = synchronized(lock) {
+        val list = listAccounts()
+        var cleared = 0
+        for (i in 0 until list.length()) {
+            val item = list.optJSONObject(i) ?: continue
+            val key = item.optString("account_key").ifBlank { item.optString("key") }
+            if (key.isBlank()) continue
+            if (accountKey != null && key != accountKey) continue
+            val hadCooldown = item.optDouble("cooldown_until", 0.0) > 0.0
+            updateAccount(key, ContentValues().apply {
+                put("cooldown_until", 0)
+                put("failure_count", 0)
+                put("updated_at", nowSeconds())
+            })
+            if (hadCooldown) cleared++
+        }
+        cleared
+    }
+
+    /** token 保活连续失败阈值：对齐上游 scheduler._keepalive_fail_threshold = 3。 */    private val KEEPALIVE_FAIL_THRESHOLD = 3
 
     /**
      * 记录一次 token 刷新失败。

@@ -31,8 +31,13 @@ package com.joy4fire.workbuddy2api
  */
 object ClientIdentity {
 
-    /** 当前对接的官方 CLI 版本。上游 product.json 的 date 字段为 2026-09-11，对应 v2.150.0。 */
-    const val CLI_VERSION = "2.150.0"
+    /**
+     * 当前对接的官方 CLI 版本。
+     *
+     * 2026-10-19 更新为 2.169.0：MITM 抓包显示官方 CLI 实际发送的是 2.169.0，
+     * 而此前固定为 2.150.0。版本号是渠道校验的可见特征之一，必须与真实客户端一致。
+     */
+    const val CLI_VERSION = "2.169.0"
 
     /** product.json 的 productName。 */
     const val PRODUCT_NAME = "CodeBuddy"
@@ -133,7 +138,9 @@ object ClientIdentity {
      * 上游看到的才是「CodeBuddy CLI 插件」而不是「无产品标识的裸 HTTP 客户端」。
      */
     fun pluginHeaders(): Map<String, String> = mapOf(
-        "X-Product" to PRODUCT_NAME,
+        // 官方实际发的是 "SaaS"（2026-10-19 MITM 抓包实证），不是 productName "CodeBuddy"。
+        // 这两个值语义不同：productName 是产品名，X-Product 是投放形态标识。
+        "X-Product" to "SaaS",
         "X-Product-Version" to CLI_VERSION,
         "X-IDE-Type" to PLATFORM,
         "X-IDE-Name" to PLATFORM,
@@ -224,4 +231,109 @@ object ClientIdentity {
         "X-Agent-Intent" to "craft",
         "X-Agent-Type" to "main"
     )
+
+    /**
+     * 网关渠道校验头 —— 2026-10-19 实测抓包后补充。
+     *
+     * 【为什么必须补】
+     *   上游对 /v2/chat/completions 增加了「渠道校验」（channel verification），
+     *   失败时返回 HTTP 400 + code 11128，displayTips 明说：
+     *   「这次调用没通过渠道校验，可能不是官方客户端发出的」。
+     *
+     *   实测排除法（同一账号、同一出口 IP=广东电信）：
+     *     · Python urllib / curl_cffi(chrome131) / curl_cffi(safari180_ios) / Node undici
+     *       四种 TLS 栈全部 11128 → 不是 TLS 指纹问题
+     *     · 补齐 Stainless 七件套仍 11128 → 不是缺 SDK 指纹
+     *     · 官方 CLI 2.169.0 在同一台机器上成功 → 不是账号/IP 风控
+     *   最终用 MITM 抓取官方 CLI 的真实出站请求，逐头比对得出本组缺失项。
+     *
+     * 【官方实际发送、我们此前缺失的头】（抓包证据：POST /v2/chat/completions）
+     *     x-requested-with: XMLHttpRequest
+     *     X-Agent-Purpose: conversation
+     *     X-Agent-Runtime: other
+     *     X-Private-Data: false
+     *     x-codebuddy-request: 1
+     *     X-Root-Request-ID: <与 X-Request-ID 同值>
+     *     X-Conversation-Request-ID: <真实 UUIDv7，非空>
+     *     baggage: codebuddy.session_id=...,codebuddy.conversation_request_id=...
+     *     traceparent: 00-<32hex trace>-<16hex span>-01
+     *     b3: <trace>-<span>-1-<parentSpan>
+     *     X-B3-TraceId / X-B3-ParentSpanId / X-B3-SpanId / X-B3-Sampled
+     *     X-Trace-ID: <同 traceId>
+     *
+     * 【与旧实现的差异】
+     *   旧实现把 X-Conversation-Request-ID 写死为空串，注释称「反代无此值，发空串」。
+     *   但抓包证明官方每笔请求都带真实 UUIDv7 —— 空串正是最显眼的破绽，故改为生成真实值。
+     *
+     * @param conversationId 会话 ID（UUIDv4，带连字符）
+     * @param messageId 本条消息 ID（UUIDv7，32 位无连字符）
+     * @param conversationRequestId 会话内请求 ID（UUIDv7，32 位无连字符）
+     */
+    fun channelVerifyHeaders(
+        conversationId: String,
+        messageId: String,
+        conversationRequestId: String
+    ): Map<String, String> {
+        // traceId 官方为 32 位 hex（W3C 128-bit），spanId 为 16 位 hex（64-bit）
+        val traceId = randomHex(32)
+        val spanId = randomHex(16)
+        val parentSpanId = randomHex(16)
+        return mapOf(
+            "x-requested-with" to "XMLHttpRequest",
+            "X-Agent-Purpose" to "conversation",
+            "X-Agent-Runtime" to "other",
+            "X-Private-Data" to "false",
+            "x-codebuddy-request" to "1",
+            // 官方：X-Root-Request-ID 与 X-Request-ID 同值（本实现中即 messageId）
+            "X-Root-Request-ID" to messageId,
+            // 官方：真实 UUIDv7，绝非空串
+            "X-Conversation-Request-ID" to conversationRequestId,
+            // W3C Trace Context
+            "traceparent" to "00-$traceId-$spanId-01",
+            // B3 单头格式：traceid-spanid-sampled-parentspanid
+            "b3" to "$traceId-$spanId-1-$parentSpanId",
+            "X-B3-TraceId" to traceId,
+            "X-B3-ParentSpanId" to parentSpanId,
+            "X-B3-SpanId" to spanId,
+            "X-B3-Sampled" to "1",
+            "X-Trace-ID" to traceId,
+            // OTel baggage：会话归因，官方逐笔携带
+            "baggage" to
+                "codebuddy.session_id=$conversationId," +
+                "codebuddy.conversation_request_id=$conversationRequestId"
+        )
+    }
+
+    /**
+     * 仅链路追踪头（不含会话相关字段）。
+     *
+     * 为什么单独抽出来：成长任务（专家召唤 / RichMeow 等）走的是**桌面版 WorkBuddy**
+     * 渠道，它有自己的 UA 与 X-IDE-* 取值，但**渠道校验（11128）是同一层网关逻辑**，
+     * 同样要求 traceparent / b3 / baggage 这组追踪头。
+     * 直接复用 [channelVerifyHeaders] 会把 CLI 的会话语义混进桌面链路，故拆成两档：
+     *   - channelVerifyHeaders：CLI 对话（含 X-Conversation-* 全套）
+     *   - tracingHeaders：桌面/非对话链路（只带追踪头）
+     */
+    fun tracingHeaders(): Map<String, String> {
+        val traceId = randomHex(32)
+        val spanId = randomHex(16)
+        val parentSpanId = randomHex(16)
+        return mapOf(
+            "x-requested-with" to "XMLHttpRequest",
+            "traceparent" to "00-$traceId-$spanId-01",
+            "b3" to "$traceId-$spanId-1-$parentSpanId",
+            "X-B3-TraceId" to traceId,
+            "X-B3-ParentSpanId" to parentSpanId,
+            "X-B3-SpanId" to spanId,
+            "X-B3-Sampled" to "1",
+            "X-Trace-ID" to traceId
+        )
+    }
+
+    /** 生成 n 位小写十六进制串（用于 traceId / spanId）。 */
+    private fun randomHex(n: Int): String {
+        val bytes = ByteArray((n + 1) / 2)
+        java.security.SecureRandom().nextBytes(bytes)
+        return bytes.joinToString("") { "%02x".format(it) }.take(n)
+    }
 }

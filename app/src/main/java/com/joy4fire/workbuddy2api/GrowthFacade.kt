@@ -41,6 +41,10 @@ object GrowthFacade {
     fun runAll(context: Context, accountKey: String, reporter: GrowthTasks.Reporter, only: Set<String>? = null): JSONArray =
         bundle(context).runner.runAll(accountKey, reporter, only)
 
+    /** 一键执行：遍历所有账号（国内版 + 国际版），单账号失败不影响其它账号。 */
+    fun runAllForAccounts(context: Context, accountKeys: List<String>, reporter: GrowthTasks.Reporter, only: Set<String>? = null): JSONArray =
+        bundle(context).runner.runAllForAccounts(accountKeys, reporter, only)
+
     /** 执行单个任务码。 */
     fun runOne(context: Context, accountKey: String, code: String, reporter: GrowthTasks.Reporter? = null): JSONObject =
         bundle(context).runner.run(accountKey, code, reporter)

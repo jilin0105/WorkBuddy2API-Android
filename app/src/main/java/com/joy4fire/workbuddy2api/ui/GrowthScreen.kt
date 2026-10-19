@@ -171,11 +171,18 @@ fun GrowthScreen(context: Context, app: AppState) {
                     enabled = !running
                 ) {
                     run("准备中…") {
-                        val results = GrowthFacade.runAll(context, accountKey, reporter = { msg: String ->
+                        // 遍历所有账号：旧实现只跑 app.selectedAccount 这一个号，
+                        // 若列表中第一个是国际版，就永远只跑国际版并全部失败
+                        // （国际版活动未开放：/v2/activity/banner 返回 activity is offline）。
+                        val keys = (0 until app.accounts.length()).mapNotNull { i ->
+                            app.accounts.optJSONObject(i)
+                                ?.optString("account_key")?.takeIf { it.isNotBlank() }
+                        }
+                        val results = GrowthFacade.runAllForAccounts(context, keys, reporter = { msg: String ->
                             statusText = msg
                         })
                         logs = flattenResults(results)
-                        "全部执行完成"
+                        "全部执行完成（${keys.size} 个账号）"
                     }
                 }
                 Spacer(Modifier.height(PcTokens.ButtonGap))
@@ -416,6 +423,8 @@ private fun flattenResults(results: JSONArray): List<String> = buildList {
             "error" -> "✗"
             else -> "?"
         }
-        add("$mark ${item.optString("task_code")}：${item.optString("message")}")
+        val account = item.optString("account")
+        val prefix = if (account.isBlank()) "" else "[${account.take(8)}] "
+        add("$mark $prefix${item.optString("task_code")}：${item.optString("message")}")
     }
 }

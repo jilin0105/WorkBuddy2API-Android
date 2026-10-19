@@ -401,7 +401,16 @@ class ApiHostService : Service() {
                 val code = response.code
                 // 失败必须落痕：此前这里直接 return，429 打完一个标记都不留，
                 // 下一个请求照样选中同一个已被限流的账号，形成限流风暴。
-                NativeCore.store(this).markAccountFailure(account.key, NativeCore.cooldownFor(code))
+                //
+                // 【例外】渠道校验失败（400/11-128 request illegal）：这是「客户端身份
+                // 不被认可」，与这个账号是否被限流无关，冷却它只会误伤正常对话——
+                // 表现为成长任务失败后，连聊天都开始报「没有可用的国际版账号」503，
+                // 60 秒后又被下一个失败请求重新冷却，形成死循环。
+                if (isChannelRejection(code, raw)) {
+                    Log.w(TAG, "channel verification rejected on ${account.uid}; skip cooldown (not an account fault)")
+                } else {
+                    NativeCore.store(this).markAccountFailure(account.key, NativeCore.cooldownFor(code))
+                }
                 if (code in RETRYABLE_STATUS && attempt == 0 && !socket.isClosed) {
                     attempt++
                     response.close()
@@ -507,6 +516,22 @@ class ApiHostService : Service() {
         JSONObject(text.ifBlank { "{}" })
     } catch (_: JSONException) {
         throw ClientError("bad json")
+    }
+
+    /**
+     * 是否为「渠道校验」拒绝（400 + 11-128）。
+     *
+     * 这类失败是上游网关判定「请求不是官方客户端发出的」，属于客户端身份问题，
+     * 换账号、等冷却都无效，因此**不能**据此冷却账号，否则会误伤同一账号的正常对话。
+     * 判定放宽：上游措辞不稳定，code 可能是数字或字符串，也见过 request illegal /
+     * channel verification 等表述。
+     */
+    private fun isChannelRejection(status: Int, raw: String): Boolean {
+        if (status != 400) return false
+        val text = raw.lowercase()
+        return text.contains("11-128") ||
+            text.contains("request illegal") ||
+            text.contains("channel verification")
     }
 
     private fun safeUpstreamError(raw: String, status: Int): JSONObject {
