@@ -1,7 +1,7 @@
 name: Build APK
 
 # 触发条件：
-#   · push 到 main —— 自动打包最新版本，滚动更新 latest-build Release
+#   · push 到 main —— 自动打包最新版本，重建 latest-build Release（发布时间随之刷新）
 #   · 打 v* 标签 —— 产出独立 Release
 #   · 手动触发   —— Actions 页面 Run workflow（可对任意分支出包）
 #   · PR         —— 只做编译校验，不产出 Release
@@ -14,17 +14,18 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write          # 发布 Release 必需；fork 仓库需在 Settings 改为 Read and write
+  contents: write
 
 concurrency:
-  # 所有触发源共用同一 group：tag 与 branch 同时推送时不互抢 latest-build
+  # 所有触发源共用同一 group，避免 tag 与 branch 同时争抢滚动 Release
   group: build-apk
   cancel-in-progress: true
 
 env:
-  # CI 与 gradle 配置的唯一真源，避免 body / sdkmanager / compileSdk 三处漂移
+  # 单一入口：CI 统一在此处声明平台与 build-tools，避免和 gradle 配置漂移
   COMPILE_SDK: android-37.0
   BUILD_TOOLS: "36.0.0"
+  RELEASE_TAG: latest-build
 
 jobs:
   build:
@@ -36,7 +37,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0     # 浅克隆会导致 action-gh-release 创建 latest-build tag 失败
+          fetch-depth: 0          # 后续要 git rev-parse / 打 tag，浅克隆会失败
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -46,7 +47,6 @@ jobs:
 
       - name: Set up Android SDK
         run: |
-          # 刻意不用 set -e：探测 sdkmanager 的过程中允许候选路径不存在，失败仅作诊断线索。
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "SDK 根目录：$SDK_ROOT"
           echo "--- cmdline-tools 布局 ---"
@@ -76,7 +76,7 @@ jobs:
       - name: Install platform and build-tools
         run: |
           set -e
-          # android-37.0 位于 Google 预览 channel（--channel=3），稳定 channel 最高只到 android-36。
+          # android-37.0 在 Google 预览 channel（--channel=3），稳定 channel 最高只到 android-36。
           # Miuix 0.9.1 的 AAR 元数据硬性要求 compileSdk >= 37，不能降版本绕过。
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" --channel=3 "platforms;${COMPILE_SDK}" "build-tools;${BUILD_TOOLS}" "platform-tools"
@@ -97,7 +97,6 @@ jobs:
 
       - name: Write local.properties
         run: |
-          # local.properties 记录本机 SDK 绝对路径，被 .gitignore 排除，CI 需自行生成
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "sdk.dir=$SDK_ROOT" > local.properties
           cat local.properties
@@ -108,7 +107,7 @@ jobs:
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Build release APK
+      - name: Build release APK (unsigned -> debug-signed)
         if: github.event_name != 'pull_request'
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
@@ -117,24 +116,25 @@ jobs:
         run: |
           set -e
           mkdir -p out
-          # debug / release 两个变体都收集，文件名带变体前缀便于区分
+          # debug 与 release 都可能存在，按变体分别收集，文件名带变体前缀
           for variant in debug release; do
             d="app/build/outputs/apk/$variant"
             [ -d "$d" ] || continue
             for f in "$d"/*.apk; do
               [ -e "$f" ] || continue
-              cp "$f" "out/${variant}-$(basename "$f")"
+              base=$(basename "$f")
+              cp "$f" "out/${variant}-${base}"
             done
           done
           count=$(ls -1 out/*.apk 2>/dev/null | wc -l)
           if [ "$count" -eq 0 ]; then
-            echo "未找到任何 APK 产物，列出实际输出目录："
+            echo "未找到任何 APK 产物"
             find app/build/outputs -type f 2>/dev/null || true
             exit 1
           fi
           echo "共收集 $count 个 APK："
           ls -lh out
-          # 主产物优先 release（R8 优化后体积更小），没有则退回 debug
+          # 主产物 = release 变体（体积更小、R8 优化）；没有则退回 debug
           main_apk=$(ls -1 out/release-*.apk 2>/dev/null | head -1 || true)
           [ -n "$main_apk" ] || main_apk=$(ls -1 out/*.apk | head -1)
           echo "main=$main_apk" >> "$GITHUB_OUTPUT"
@@ -142,7 +142,9 @@ jobs:
           echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           version=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1 || echo unknown)
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "主产物：$main_apk（版本 $version）"
+          echo "built_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+          echo "built_at_iso=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          echo "主产物：$main_apk（$version）"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -150,35 +152,66 @@ jobs:
           name: apk-${{ github.sha }}
           path: out/*.apk
           retention-days: 30
-          if-no-files-found: error     # 路径不匹配立刻红，杜绝静默空包
+          if-no-files-found: error
 
+      # 滚动 Release：published_at 是只读字段，唯一刷新方式 = 删除后重建。
+      # 用 gh CLI 而不是 action-gh-release，因为后者对已存在 release 只覆盖资产、不动发布时间。
       - name: Publish rolling release
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          # 固定 tag 做滚动更新：始终一个入口，不随提交数堆历史 Release。
-          # tag 由 action 自动创建；overwrite_files 负责覆盖同名资产，无需手工删。
-          tag_name: latest-build
-          name: 最新构建（latest-build）
-          body: |
-            自动构建产出的 APK。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.apk.outputs.version }}
+          SHA: ${{ steps.apk.outputs.sha }}
+          MAIN_APK: ${{ steps.apk.outputs.main }}
+          APK_SIZE: ${{ steps.apk.outputs.size }}
+          BUILT_AT: ${{ steps.apk.outputs.built_at }}
+          BUILT_AT_ISO: ${{ steps.apk.outputs.built_at_iso }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
 
-            | 项 | 值 |
-            | --- | --- |
-            | 版本 | ${{ steps.apk.outputs.version }} |
-            | 提交 | `${{ github.sha }}` |
-            | 分支 | `main` |
-            | 主产物 | `${{ steps.apk.outputs.main }}` |
-            | 体积 | ${{ steps.apk.outputs.size }} |
-            | compileSdk | ${{ env.COMPILE_SDK }} |
-            | build-tools | ${{ env.BUILD_TOOLS }} |
+          # 1. 确保 tag 指向当前 commit（release 重建后 tag 必须存在）
+          git tag -f "$RELEASE_TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$RELEASE_TAG"
 
-            > debug 与 release 两套都附在本 Release 中，release 变体复用 debug 签名。
-            > 安装前请先卸载设备上的旧版本，或确认签名一致。
-          files: out/*.apk
-          fail_on_unmatched_files: true
-          overwrite_files: true
-          make_latest: true
+          # 2. 删除旧 release 与旧 tag，让 published_at 归零重建
+          #    （只删 release 不够，tag 残留会让下次 create 报 already exists）
+          gh release delete "$RELEASE_TAG" --repo "$REPO" --yes --cleanup-tag || true
+
+          # 3. 写发布说明
+          cat > /tmp/notes.md <<NOTES
+          ### 自动构建产物
+
+          本 Release 每次 push 到 \`main\` 后重建，发布时间即最近一次构建时间。
+
+          | 项 | 值 |
+          | --- | --- |
+          | 构建时间 | ${BUILT_AT} |
+          | 版本 | ${VERSION} |
+          | 提交 | \`${SHA}\` |
+          | 分支 | \`main\` |
+          | 主产物 | \`$(basename "$MAIN_APK")\` |
+          | 体积 | ${APK_SIZE} |
+          | compileSdk | ${COMPILE_SDK} |
+          | build-tools | ${BUILD_TOOLS} |
+
+          - 下载 **release** 包日常使用（R8 优化，体积小）
+          - 下载 **debug** 包排查崩溃（含符号，体积大）
+          - 构建日志：${RUN_URL}
+
+          > release 变体复用 debug 签名。切换安装时请先卸载设备上的旧版本，或确认签名一致。
+          NOTES
+
+          # 4. 重建 release，发布时间 = 现在
+          gh release create "$RELEASE_TAG" out/*.apk \
+            --repo "$REPO" \
+            --target "$GITHUB_SHA" \
+            --title "最新构建 ${VERSION} (${SHA})" \
+            --notes-file /tmp/notes.md \
+            --latest
+
+          echo "Release 已重建：${GITHUB_SERVER_URL}/${REPO}/releases/tag/${RELEASE_TAG}"
 
       - name: Publish tag release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -188,6 +221,7 @@ jobs:
           body: |
             标签 `${{ github.ref_name }}` 的构建产物。
 
+            - 构建时间：${{ steps.apk.outputs.built_at }}
             - 版本：${{ steps.apk.outputs.version }}
             - 提交：`${{ github.sha }}`
             - 主产物：`${{ steps.apk.outputs.main }}`
