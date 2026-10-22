@@ -98,6 +98,46 @@ fun PcConfirmDialog(
     )
 }
 
+/**
+ * 单选对话框：从固定选项里挑一个。
+ *
+ * 为什么单独加一个：思考强度这类「枚举型」设置用输入框不合适（用户得记住合法值），
+ * 开关又表达不了四档。Miuix 的 preference 组件里没有现成的单选弹层，
+ * 这里照 PcConfirmDialog 的骨架补一个最小的。
+ *
+ * @param options 值到展示文案的映射，展示顺序即传入顺序
+ * @param selected 当前值，命中项前会打勾
+ */
+@Composable
+fun PcOptionDialog(
+    show: Boolean,
+    title: String,
+    options: List<Pair<String, String>>,
+    selected: String,
+    onPick: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    WindowDialog(
+        show = show,
+        title = title,
+        onDismissRequest = onDismiss,
+        content = {
+            Column(Modifier.fillMaxWidth()) {
+                options.forEach { (value, label) ->
+                    val active = value == selected
+                    TextButton(
+                        text = if (active) "✓ $label" else label,
+                        onClick = { onPick(value) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Spacer(Modifier.height(PcTokens.SectionGap))
+                TextButton(text = "取消", onClick = onDismiss, modifier = Modifier.fillMaxWidth())
+            }
+        }
+    )
+}
+
 /** 只有「知道了」的提示框。 */
 @Composable
 fun PcAlertDialog(

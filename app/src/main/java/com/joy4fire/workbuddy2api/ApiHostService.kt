@@ -386,11 +386,20 @@ class ApiHostService : Service() {
                 response = try {
                     call.execute()
                 } catch (e: IOException) {
-                    NativeCore.store(this).markAccountFailure(account.key, NativeCore.cooldownFor(503))
+                    // 【不要冷却账号】断网/DNS 失败/连接被重置是「本机网络或链路」问题，
+                    // 不是这个账号被上游限制。旧实现无条件 markAccountFailure(120s)，
+                    // 结果是一断网，所有用过的账号全被打上冷却，恢复网络后还要等 2 分钟
+                    // 才能用，并且账号页会显示「冷却中」——与事实严重不符。
+                    //
+                    // 现在的处理：
+                    //   · 只记日志 + 本请求内换号重试一次（换号对链路抖动偶尔有效）
+                    //   · 绝不写 cooldown_until / failure_count
+                    //   · 若换号后仍失败，把原始 IOException 抛给调用方，由上层报网络错误
+                    Log.w(TAG, "network error on ${account.uid} (${e.javaClass.simpleName}: ${e.message}); no cooldown")
                     if (attempt == 0 && !socket.isClosed) {
                         attempt++
                         val healthy = NativeCore.store(this).countHealthy(region.id)
-                        Log.w(TAG, "network error on ${account.uid} (${e.message}); retrying with another account (healthy=$healthy)")
+                        Log.w(TAG, "retrying after network error (healthy=$healthy)")
                         if (healthy >= 1) continue
                     }
                     throw e
@@ -417,7 +426,15 @@ class ApiHostService : Service() {
                 // 不被认可」，与这个账号是否被限流无关，冷却它只会误伤正常对话——
                 // 表现为成长任务失败后，连聊天都开始报「没有可用的国际版账号」503，
                 // 60 秒后又被下一个失败请求重新冷却，形成死循环。
-                if (shouldCooldownAccount(code)) {
+                if (code == 429) {
+                    // 429 = 该账号对这个模型「瞬时饱和」，不是账号坏了。
+                    // 若用 cooldown 标记，账号页会整片变灰、诊断报「N 个冷却中」，
+                    // 但额度明明还有——这就是「一个账号 429，另外的也被冻结」的错觉。
+                    // 改用 last_used_at 软退避：选号自动跳过它，账号页仍显示健康，
+                    // 额度恢复后自然回来，无需人工清冷却。
+                    NativeCore.store(this).markAccountThrottled(account.key, THROTTLE_429_SECONDS)
+                    Log.w(TAG, "upstream 429 on ${account.uid}; soft-throttle ${THROTTLE_429_SECONDS}s (no cooldown)")
+                } else if (shouldCooldownAccount(code)) {
                     NativeCore.store(this).markAccountFailure(account.key, NativeCore.cooldownFor(code))
                 } else {
                     // 4xx 里的非限流类错误（400/404/409/422/11-128 等）是「这一次请求
@@ -498,8 +515,20 @@ class ApiHostService : Service() {
             }
         } catch (e: Exception) {
             val disconnected = headersSent && (writingClient || socket.isClosed || isDisconnect(e))
+            // 选号阶段抛的异常（如"没有可用的国际版账号"）到不了 upstream.account 赋值点，
+            // account 仍是 null，直接记日志会污染成"扣费账号未记录"。
+            // 这里补一次诊断：把账号池的真实状态附在错误里，直接看出是哪道筛选卡住了。
+            val reason = if (disconnected) "client disconnected" else {
+                val msg = e.message ?: e.javaClass.simpleName
+                if (account == null) {
+                    val regionHint = region?.id ?: app.optString("region").ifBlank { "domestic" }
+                    val status = runCatching { NativeStore.get(this).regionStatus(regionHint) }.getOrNull()
+                    if (status.isNullOrBlank() || status == "null") msg
+                    else "$msg —— 账号池[$regionHint]：$status"
+                } else msg
+            }
             logUsage(protocol, model, startedAt, if (disconnected) "aborted" else "error",
-                if (disconnected) "client disconnected" else (e.message ?: e.javaClass.simpleName), collector.usage,
+                reason, collector.usage,
                 inputSummary, collector.outputText(), collector.reasoningText(), app, account)
             if (!headersSent) throw if (e is IOException) e else IOException(e)
             if (!disconnected) runCatching { writeUtf8(output, streamError(protocol, e.message ?: "上游流异常")) }
@@ -546,7 +575,11 @@ class ApiHostService : Service() {
      * 重新冷却，形成死循环。
      */
     private fun shouldCooldownAccount(status: Int): Boolean =
-        status == 429 || status == 401 || status == 403 || status >= 500
+        // 429 不计入账号冷却：上游 14003 是「该模型请求量饱和」的全局限流，
+        // 与账号本身无关。旧逻辑把 429 冷却 5 分钟，导致 3 个健康账号在
+        // 一次饱和高峰里被逐个冻住，随后报「没有可用的国际版账号」。
+        // 现在的策略：429 只在本次请求内换号重试，账号状态保持不变。
+        status == 401 || status == 403 || status >= 500
 
     private fun safeUpstreamError(raw: String, status: Int): JSONObject {
         val parsed = runCatching { JSONObject(raw) }.getOrNull()
@@ -1067,6 +1100,19 @@ class ApiHostService : Service() {
         private const val MAX_BODY_BYTES = 10L * 1024L * 1024L
         private const val MAX_HEADER_LINE = 16 * 1024
         private const val TAG = "ApiHostService"
+
+        /**
+         * 429（模型繁忙 / 上游限流）只做「账号级软退避」，不写入冷却。
+         *
+         * 判定依据（实测 2026-10-20）：
+         * - 14003 "too many requests" 是**平台侧模型饱和**，与账号本身无关；
+         * - 旧的 cooldownFor(429)=300s 会把 3 个健康账号在几十秒内全部打成「冷却中」，
+         *   选号直接报「没有可用的国际版账号」，但账号页仍显示健康，形成矛盾。
+         *
+         * 软退避的实现：把 last_used_at 推到将来，accountReadyForSend 会自动跳过该账号，
+         * 但 account 表里的 status/cooldown_until 不变，账号页不会误报。
+         */
+        private const val THROTTLE_429_SECONDS = 60L
 
         /**
          * 内容被拦后触发降级提示词（移植自 1.2.7 的 useDegradedPrompt）。

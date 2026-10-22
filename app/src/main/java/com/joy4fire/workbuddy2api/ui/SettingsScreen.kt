@@ -50,6 +50,35 @@ fun SettingsScreen(context: Context, app: AppState, onOpenSub: (SubPage) -> Unit
                     checked = app.settings.optString("keepalive_enabled", "1") in setOf("1", "true"),
                     onChange = { app.saveSetting("keepalive_enabled", if (it) "1" else "0") }
                 )
+                PcDivider()
+                // 思考强度：四档枚举，点按弹单选。
+                // 为什么放在首屏而不是二级页：这是用户最常调的两个开关之一
+                // （另一个是保活），埋进二级页会让人找不到。
+                val effort = app.settings.optString("reasoning_effort", "high")
+                var showEffort by remember { mutableStateOf(false) }
+                ArrowPreference(
+                    title = "思考强度",
+                    summary = reasoningEffortLabel(effort),
+                    onClick = { showEffort = true }
+                )
+                if (showEffort) {
+                    PcOptionDialog(
+                        show = true,
+                        title = "思考强度",
+                        options = listOf(
+                            "off" to "关闭 · 最快，最省额度",
+                            "low" to "低 · 简短思考",
+                            "medium" to "中 · 均衡",
+                            "high" to "高 · 完整思考（默认）"
+                        ),
+                        selected = effort,
+                        onPick = {
+                            app.saveSetting("reasoning_effort", it)
+                            showEffort = false
+                        },
+                        onDismiss = { showEffort = false }
+                    )
+                }
             }
         }
         item {
@@ -176,6 +205,19 @@ private fun SwitchSettingRow(
         Spacer(Modifier.height(PcTokens.RowGap))
         Switch(checked = checked, onCheckedChange = onChange)
     }
+}
+
+/**
+ * 思考强度的展示文案。
+ *
+ * 四项与 DEFAULT_SETTINGS["reasoning_effort"] 的取值严格对应；
+ * 遇到未知值回落到「高」，避免显示空白让用户以为配置丢了。
+ */
+private fun reasoningEffortLabel(value: String): String = when (value.lowercase()) {
+    "off", "none", "disabled" -> "关闭 · 不思考，最省额度"
+    "low" -> "低 · 简短思考"
+    "medium" -> "中 · 均衡"
+    else -> "高 · 完整思考（默认）"
 }
 
 /**

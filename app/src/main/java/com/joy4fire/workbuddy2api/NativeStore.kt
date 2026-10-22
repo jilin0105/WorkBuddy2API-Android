@@ -230,6 +230,21 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
     })
 
     /**
+     * 429 软退避：只把 last_used_at 推到将来，让 selectAccount 的账号级限速跳过它。
+     *
+     * 为什么不复用 markAccountFailure：429（too many requests / model busy）是上游对
+     * 「这个模型」的瞬时限流，不是账号坏了。此前用 cooldown_until 记，会让账号页把
+     * 三个本来就健康的账号一起显示成冷却，并且冷却期间再没有任何账号可用。
+     * 这里改记 last_used_at：选号会自动跳过，但账号页的 healthy 判定（只看 enabled /
+     * 额度 / cooldown_until）仍然显示健康，与真实状态一致。
+     *
+     * @param backoffSeconds 退避秒数
+     */
+    fun markAccountThrottled(accountKey: String, backoffSeconds: Long): Boolean = updateAccount(accountKey, ContentValues().apply {
+        put("last_used_at", nowSeconds() + max(0L, backoffSeconds)); put("updated_at", nowSeconds())
+    })
+
+    /**
      * 统计「健康」账号数：可用 + 不在冷却 + 仍有额度。
      *
      * 判定口径与 selectAccount 的候选过滤条件完全一致（对齐上游 pool.healthy()）。
@@ -981,7 +996,18 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
             "prompt_mode" to "custom",
             "prompt_text" to "",
             "sanitize_fingerprints" to "1",
-            "use_degraded_prompt" to "false"
+            "use_degraded_prompt" to "false",
+            /**
+             * 思考强度（reasoning effort）。取值：off / low / medium / high。
+             *
+             * 语义：这是「客户端希望模型思考多少」的表达，由 PromptInjection.alignThinking
+             * 翻译成上游认的字段（deepseek 系走 thinking.type，OpenAI 系走 reasoning_effort）。
+             * 默认 high：不思考比多思考更让用户困惑；要省额度可切到 off。
+             *
+             * 必须在此登记：saveSettings() 只写 `key in DEFAULT_SETTINGS` 的键，
+             * 未登记的键会被静默丢弃，表现为「设置页保存成功、重启后又变回默认」。
+             */
+            "reasoning_effort" to "high"
         )
         /**
          * 记录内容字段的入库上限。取值理由：

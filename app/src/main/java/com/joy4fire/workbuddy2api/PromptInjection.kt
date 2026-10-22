@@ -91,6 +91,25 @@ object PromptInjection {
         //    但 degraded 模式下注入的是英文通用词，被 `11128` 这类宽松规则命中会显得很怪）。
         if (sanitize) sanitizeFingerprints(body)
 
+        // 【思考开关归一化】此前 alignThinking / clampReasoningEffort 写好了却从未被调用，
+        // 导致「客户端要求思考」到不了上游 —— 上游按默认值处理，表现为模型不思考。
+        // 位置必须在注入 system 之前？不需要：这两个函数只碰 body 的顶层思考字段，
+        // 与 messages 无关，放在清洗之后、注入之前最直观。
+        val model = body.optString("model")
+        if (model.isNotBlank()) {
+            // 默认档位取 high：上游对高思考档的接受度最好，且「不思考」通常比「多思考」
+            // 更让用户困惑。用户若要省额度，可显式传 thinking.type=disabled。
+            val defaultEffort = settings.optString("reasoning_effort").ifBlank { "high" }
+            // 未配置 supported_efforts 时传 null，clampReasoningEffort 会跳过夹紧。
+            val supportedEfforts = settings.optString("supported_efforts")
+                .takeIf { it.isNotBlank() }
+                ?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }
+            // deepseek 系用 thinking.type 表达开关，OpenAI 系用 reasoning_effort，
+            // 混用会让思考链丢失，所以先按模型家族对齐再夹紧档位。
+            runCatching { alignThinking(body, model, defaultEffort) }
+            runCatching { clampReasoningEffort(body, model, supportedEfforts) }
+        }
+
         // 2) 再注入。passthrough 且未降级 = 完全不碰 messages，保持调用方原样。
         if (mode != "custom" && !degraded) return
         val prompt = when {
@@ -228,6 +247,9 @@ object PromptInjection {
      */
     fun alignThinking(body: JSONObject, model: String, defaultEffort: String) {
         if (!model.lowercase(Locale.US).contains("deepseek")) return
+        // 「关闭」是一等状态：不能把 "off" 当 reasoning_effort 发上去（上游不认这个值），
+        // 必须翻译成 thinking.type=disabled 并清掉 effort 字段。
+        val off = defaultEffort.lowercase(Locale.US) in setOf("off", "none", "disabled")
         val thinking = body.optJSONObject("thinking")
         val type = thinking?.optString("type").orEmpty().trim()
         if (type.isNotEmpty()) {
@@ -237,6 +259,13 @@ object PromptInjection {
             } else if (!body.has("reasoning_effort") && !body.has("reasoningEffort")) {
                 body.put("reasoning_effort", defaultEffort.ifBlank { "high" })
             }
+            return
+        }
+        if (off) {
+            // 用户把默认档设成了「关闭」：显式关掉，避免上游按自己默认值开启思考。
+            body.put("thinking", JSONObject().put("type", "disabled"))
+            body.remove("reasoning_effort")
+            body.remove("reasoningEffort")
             return
         }
         if (thinking == null) body.put("thinking", JSONObject().put("type", "enabled"))
