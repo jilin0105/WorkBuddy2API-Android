@@ -774,26 +774,47 @@ object NativeCore {
         // 计费接口必须走浏览器 UA：上游 billing.py:44-47 注释明确网关 WAF 会拦非浏览器 UA
         // 的计费请求（403/10085）。主链路不得使用此 UA（见 ClientIdentity 注释）。
         val h = account.apply { this["User-Agent"] = ClientIdentity.BROWSER_UA }
-        val bodies = listOf(
-            "${source.backend}/billing/meter/get-user-resource-summary" to JSONObject(),
-            "${source.backend}/v2/billing/meter/get-user-resource" to JSONObject().put("PageNumber", 1).put("PageSize", 100).put("ProductCode", "p_tcaca").put("Status", JSONArray().put(0).put(3))
+        // 计费接口未必挂在 region.backend 上：国际版在 www.codebuddy.ai 可用；
+        // 国内版 region.backend 是 copilot.tencent.com，而官方桌面版计费走的是
+        // productManager.getEndpoint()（Web 域）。按「backend → defaultDomain」
+        // 顺序探测，命中即止，避免国内版因域名不对而整段拿不到额度。
+        val hosts = linkedSetOf(source.backend, "https://" + source.region.defaultDomain)
+        // 官方 desktop 客户端个人用量由两个接口拼成（app.asar getPersonalUsage）：
+        //   /billing/meter/get-user-resource-summary        汇总
+        //   /billing/meter/get-user-resource-paid-packages  付费包分页
+        // 旧的 /v2/billing/meter/get-user-resource 实测 404（多了 /v2 且端点名不对）。
+        val probes = listOf(
+            "/billing/meter/get-user-resource-summary" to JSONObject(),
+            "/billing/meter/get-user-resource-paid-packages" to JSONObject().put("PageNumber", 1).put("PageSize", 100)
         )
         var accounts = JSONArray()
-        for ((url, body) in bodies) {
-            val response = runCatching { executeJson(request(url, "POST", body, h), true) }.getOrNull() ?: continue
-            accounts = extractBillingAccounts(response)
-            if (accounts.length() > 0) break
+        var lastError: String? = null
+        loop@ for (host in hosts) {
+            for ((path, body) in probes) {
+                val response = runCatching { executeJson(request(host + path, "POST", body, h), true) }
+                    .onFailure { lastError = it.message }
+                    .getOrNull() ?: continue
+                val list = extractBillingPackages(response)
+                if (list.length() > 0) { accounts = list; break@loop }
+            }
         }
-        if (accounts.length() == 0) throw IOException("额度接口未返回账号数据")
+        if (accounts.length() == 0) {
+            throw IOException("额度接口未返回账号数据" + (lastError?.let { "（$it）" } ?: ""))
+        }
         var remain = 0.0; var total = 0.0; var expire: Double? = null; val packages = JSONArray()
         for (i in 0 until accounts.length()) {
             val a = accounts.optJSONObject(i) ?: continue
-            val cycle = a.optDouble("CycleCapacitySize", 0.0)
-            val r = if (cycle > 0) a.optDouble("CycleCapacityRemain") else a.optDouble("CapacityRemain")
-            val t = if (cycle > 0) cycle else a.optDouble("CapacitySize")
+            // 两套字段名并存：
+            //   Accounts 形态：CycleCapacitySize / CycleCapacityRemain / CapacitySize / CapacityRemain
+            //   Packages 形态：CycleTotalCapacity / CycleRemainCapacity（官方当前返回值）
+            val cycle = a.firstDouble("CycleCapacitySize", "CycleTotalCapacity")
+            val r = if (cycle > 0) a.firstDouble("CycleCapacityRemain", "CycleRemainCapacity")
+                    else a.firstDouble("CapacityRemain", "RemainCapacity")
+            val t = if (cycle > 0) cycle else a.firstDouble("CapacitySize", "TotalCapacity")
             remain += r; total += t
             packages.put(JSONObject(a.toString()).put("remaining", r).put("total", t))
-            val rawExpiry = listOf("ExpireTime", "PackageEndTime", "EndTime").firstNotNullOfOrNull { key -> a.opt(key)?.toString()?.toDoubleOrNull() }
+            val rawExpiry = listOf("ExpireTime", "PackageEndTime", "EndTime", "CycleEndTime")
+                .firstNotNullOfOrNull { key -> a.opt(key)?.toString()?.toDoubleOrNull() }
             if (rawExpiry != null && r > 0) { val sec = if (rawExpiry > 10_000_000_000L) rawExpiry / 1000 else rawExpiry; expire = expire?.coerceAtMost(sec) ?: sec }
         }
         store(context).setAccountCredits(source.key, remain, total, expire, packages)
@@ -1089,6 +1110,31 @@ object NativeCore {
     private fun extractBillingAccounts(data: JSONObject): JSONArray = data.optJSONObject("data")?.optJSONObject("Response")?.optJSONObject("Data")?.optJSONArray("Accounts")
         ?: data.optJSONObject("data")?.optJSONObject("Response")?.optJSONArray("Accounts")
         ?: data.optJSONObject("data")?.optJSONArray("Accounts") ?: data.optJSONArray("Accounts") ?: JSONArray()
+
+    /**
+     * 从计费响应里取出「额度条目」数组。
+     *
+     * 官方 /billing/meter/get-user-resource-summary 返回的是 data.Packages
+     * （字段 CycleTotalCapacity / CycleRemainCapacity），而旧版/企业形态返回
+     * Accounts（CycleCapacitySize / CycleCapacityRemain）。两种都要认，
+     * 否则会拿到空数组、最终抛「额度接口未返回账号数据」。
+     */
+    private fun extractBillingPackages(data: JSONObject): JSONArray {
+        val body = data.optJSONObject("data") ?: data
+        body.optJSONArray("Packages")?.let { if (it.length() > 0) return it }
+        body.optJSONObject("Response")?.optJSONObject("Data")?.optJSONArray("Packages")?.let { if (it.length() > 0) return it }
+        return extractBillingAccounts(data)
+    }
+
+    /** 依次尝试多个候选键名，返回第一个可解析为数字的值（缺失/非法按 0）。 */
+    private fun JSONObject.firstDouble(vararg keys: String): Double {
+        for (k in keys) {
+            if (!has(k) || isNull(k)) continue
+            val v = optDouble(k, Double.NaN)
+            if (!v.isNaN()) return v
+        }
+        return 0.0
+    }
     private fun noAuthHeaders(region: AccountRegion) = ClientIdentity.noAuthHeaders(region)
     private fun unwrap(root: JSONObject): JSONObject {
         if (root.has("code") && root.optInt("code", -1) != 0) {
