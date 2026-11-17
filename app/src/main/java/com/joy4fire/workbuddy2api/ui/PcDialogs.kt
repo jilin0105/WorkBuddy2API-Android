@@ -69,7 +69,10 @@ fun PcConfirmDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    WindowDialog(
+    // 返回手势/返回键关窗：Miuix 的 WindowDialog 不注册返回处理，
+    // AppShell 的 BackHandler 会先消费返回事件，TalkBack 下又点不到空白区。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = show,
         title = title,
         onDismissRequest = onDismiss,
@@ -117,7 +120,12 @@ fun PcOptionDialog(
     onPick: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
-    WindowDialog(
+    // 返回手势 / 返回键：Miuix 的 WindowDialog 自己不注册返回处理，
+    // 而 AppShell 里的 BackHandler 会先把返回事件消费掉，
+    // 表现就是「弹窗只能点取消，系统返回没反应」。
+    // 这里用全限定名引用，避免为一个调用再动 import 块。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = show,
         title = title,
         onDismissRequest = onDismiss,
@@ -147,7 +155,10 @@ fun PcAlertDialog(
     buttonText: String = "知道了",
     onDismiss: () -> Unit
 ) {
-    WindowDialog(
+    // 返回手势/返回键关窗：Miuix 的 WindowDialog 不注册返回处理，
+    // AppShell 的 BackHandler 会先消费返回事件，TalkBack 下又点不到空白区。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = show,
         title = title,
         onDismissRequest = onDismiss,
@@ -187,7 +198,9 @@ fun PcInputDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    WindowDialog(
+    // 系统返回（含全面屏手势）关窗：TalkBack 下无法点空白区，必须有这条路径。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = show,
         title = title,
         onDismissRequest = onDismiss,
@@ -233,6 +246,8 @@ fun PcDetailDialog(
     onCopy: (() -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
+    // 系统返回（含全面屏手势）关窗：TalkBack 下无法点空白区，必须有这条路径。
+    RegisterDialogBack { onDismiss() }
     // 裁剪放在 remember(body) 里：正文动辄上百 KB，每次重组都重算会拖慢弹窗弹出。
     val display = remember(body) {
         if (body.length <= DETAIL_DISPLAY_LIMIT) body
@@ -240,7 +255,7 @@ fun PcDetailDialog(
             "\n\n… 已省略 ${body.length - DETAIL_DISPLAY_LIMIT} 字符（全文共 ${body.length} 字符）\n" +
             "点「${copyLabel ?: "复制"}」可获取未裁剪的完整内容。"
     }
-    WindowDialog(
+    PcDialog(
         show = show,
         title = title,
         onDismissRequest = onDismiss,
@@ -288,7 +303,10 @@ fun PcLogDialog(
     lines: List<String>,
     onDismiss: () -> Unit
 ) {
-    WindowDialog(
+    // 返回手势/返回键关窗：Miuix 的 WindowDialog 不注册返回处理，
+    // AppShell 的 BackHandler 会先消费返回事件，TalkBack 下又点不到空白区。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = show,
         title = title,
         onDismissRequest = onDismiss,

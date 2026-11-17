@@ -41,7 +41,11 @@ fun SettingRow(
 ) {
     var editing by remember { mutableStateOf(false) }
 
-    PcRow(
+    // 必须用 PcClickRow 而不是 PcRow：PcRow 虽然声明了 onClick 参数，
+    // 但函数体里从未使用它（Row 上没有任何 clickable 修饰）——
+    // 表现为「定时参数」整页点上去毫无反应。PcClickRow 内部是 Card(onClick)，
+    // 既有按压态，也真的把点击接上了。
+    PcClickRow(
         title = label,
         summary = hint,
         value = value.ifBlank { "未设置" },
@@ -75,7 +79,11 @@ private fun SettingEditDialog(
     // 若沿用 remember {} 会把上一项的输入带过来（串值）。
     var text by remember(label) { mutableStateOf(initial) }
 
-    WindowDialog(
+    // 返回手势 / 返回键：Miuix 的 WindowDialog 不注册返回处理，
+    // 而 AppShell 的 BackHandler 会先把返回事件消费掉，
+    // 于是「定时参数」的编辑框只能点取消才能退出。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = true,
         title = label,
         onDismissRequest = onDismiss,
@@ -120,7 +128,10 @@ fun PriorityDialog(
 ) {
     var value by remember(accountLabel) { mutableStateOf(initial.coerceIn(0, PRIORITY_CEILING)) }
 
-    WindowDialog(
+    // 返回手势/返回键关窗：Miuix 的 WindowDialog 不注册返回处理，
+    // AppShell 的 BackHandler 会先消费返回事件，TalkBack 下又点不到空白区。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = true,
         title = "设置优先级",
         summary = accountLabel,

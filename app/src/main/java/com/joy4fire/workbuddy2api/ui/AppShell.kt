@@ -14,6 +14,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.NavigationBar
@@ -99,8 +105,26 @@ fun AppShell(context: Context, app: AppState) {
     // 分级：① 有二级页 → 关二级页；② 非概览 Tab → 回概览；③ 概览 → 交给系统退出。
     // 用 enabled 开关而不是单 handler 内分支：未启用的 handler 不参与返回栈，
     // 系统才能正确判定"无处可退"并执行退出。
-    BackHandler(enabled = sub != SubPage.NONE) { goBack() }
-    BackHandler(enabled = sub == SubPage.NONE && tab != AppTab.OVERVIEW) { tab = AppTab.OVERVIEW }
+    // 返回事件唯一入口：按「弹窗 → 二级页 → 一级页 → 退出」分发。
+    //
+    // 为什么不再用多个 enabled 开关的 BackHandler：Miuix 的弹窗跑在独立 Dialog 窗口，
+    // 它内部的返回处理靠 NavCompat 自建的那个根 dispatcher，而那个 dispatcher 没人喂事件
+    // （不接 Activity 的 OnBackPressedDispatcher），弹窗永远收不到返回。
+    // 所以在弹窗内写 BackHandler 一律无效（实测），改为 DialogBackQueue 注册 + 这里分发。
+    //
+    // enabled 恒为 true：因为总得有个人处理「无处可退」的情况，否则手势返回会失效；
+    // 最后一档显式调用 finish()，等价于系统默认行为。
+    val activity = LocalContext.current.findActivity()
+    BackHandler(enabled = true) {
+        android.util.Log.i("WBACK", "appshell-back dialogOpen=" + (DialogBackQueue.top() != null))
+        val dismissTop = DialogBackQueue.top()
+        when {
+            dismissTop != null -> dismissTop()
+            sub != SubPage.NONE -> goBack()
+            tab != AppTab.OVERVIEW -> tab = AppTab.OVERVIEW
+            else -> activity?.finish()
+        }
+    }
 
     // 提供 NavigationEventDispatcherOwner：Miuix 的弹层/下拉/抽屉内部会注册
     // NavigationBackHandler，而 Compose Dialog 是独立 window、View 树取不到宿主的
@@ -150,37 +174,43 @@ fun AppShell(context: Context, app: AppState) {
                                 selected = tab == AppTab.OVERVIEW,
                                 onClick = { tab = AppTab.OVERVIEW },
                                 icon = MiuixIcons.Tasks,
-                                label = AppTab.OVERVIEW.label
+                                label = AppTab.OVERVIEW.label,
+                                modifier = Modifier.tabSemantics(AppTab.OVERVIEW.label, tab == AppTab.OVERVIEW) { tab = AppTab.OVERVIEW }
                             )
                             NavigationBarItem(
                                 selected = tab == AppTab.ACCOUNTS,
                                 onClick = { tab = AppTab.ACCOUNTS },
                                 icon = MiuixIcons.ContactsCircle,
-                                label = AppTab.ACCOUNTS.label
+                                label = AppTab.ACCOUNTS.label,
+                                modifier = Modifier.tabSemantics(AppTab.ACCOUNTS.label, tab == AppTab.ACCOUNTS) { tab = AppTab.ACCOUNTS }
                             )
                             NavigationBarItem(
                                 selected = tab == AppTab.MODELS,
                                 onClick = { tab = AppTab.MODELS },
                                 icon = MiuixIcons.Layers,
-                                label = AppTab.MODELS.label
+                                label = AppTab.MODELS.label,
+                                modifier = Modifier.tabSemantics(AppTab.MODELS.label, tab == AppTab.MODELS) { tab = AppTab.MODELS }
                             )
                             NavigationBarItem(
                                 selected = tab == AppTab.APPS,
                                 onClick = { tab = AppTab.APPS },
                                 icon = MiuixIcons.GridView,
-                                label = AppTab.APPS.label
+                                label = AppTab.APPS.label,
+                                modifier = Modifier.tabSemantics(AppTab.APPS.label, tab == AppTab.APPS) { tab = AppTab.APPS }
                             )
                             NavigationBarItem(
                                 selected = tab == AppTab.SETTINGS,
                                 onClick = { tab = AppTab.SETTINGS },
                                 icon = MiuixIcons.Settings,
-                                label = AppTab.SETTINGS.label
+                                label = AppTab.SETTINGS.label,
+                                modifier = Modifier.tabSemantics(AppTab.SETTINGS.label, tab == AppTab.SETTINGS) { tab = AppTab.SETTINGS }
                             )
                             NavigationBarItem(
                                 selected = tab == AppTab.GROWTH,
                                 onClick = { tab = AppTab.GROWTH },
                                 icon = MiuixIcons.Favorites,
-                                label = AppTab.GROWTH.label
+                                label = AppTab.GROWTH.label,
+                                modifier = Modifier.tabSemantics(AppTab.GROWTH.label, tab == AppTab.GROWTH) { tab = AppTab.GROWTH }
                             )
                         }
                     }
@@ -213,4 +243,26 @@ fun AppShell(context: Context, app: AppState) {
             }
         }
     }
+}
+
+/**
+ * 底栏 Tab 的无障碍语义：合并为单个可聚焦节点。
+ *
+ * 背景：Miuix 的 NavigationBarItem 同时渲染「图标」与「文字」两个节点，
+ * 图标自带一份与 label 同名的描述，TalkBack 聚焦时会连读两遍
+ * （听感就是「已选中 概览 概览」）。
+ *
+ * clearAndSetSemantics 会清掉子节点语义，只保留这里声明的一份；
+ * 同时必须补回选中态、角色与点击动作，否则节点会变成不可操作、
+ * 也不再播报「已选中」——这是「过度清除」的常见后果。
+ */
+private fun Modifier.tabSemantics(
+    label: String,
+    selectedTab: Boolean,
+    onSelect: () -> Unit
+): Modifier = clearAndSetSemantics {
+    contentDescription = label
+    selected = selectedTab
+    role = Role.Tab
+    onClick { onSelect(); true }
 }

@@ -372,7 +372,10 @@ private fun GrowthActionsDialog(
     onRefresh: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    top.yukonga.miuix.kmp.window.WindowDialog(
+    // 同账号页「更多操作」：Miuix 的 WindowDialog 不处理返回，
+    // 补一条让手势/返回键能关窗（TalkBack 下点不到空白区）。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = true,
         title = "更多操作",
         onDismissRequest = onDismiss,

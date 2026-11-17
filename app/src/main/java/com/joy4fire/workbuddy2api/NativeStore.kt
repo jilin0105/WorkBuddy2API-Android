@@ -988,6 +988,15 @@ class NativeStore private constructor(context: Context) : SQLiteOpenHelper(
             "aa_refresh_hour" to "7",
             "keepalive_hour" to "22",
             "keepalive_enabled" to "1",
+            /**
+             * 定时任务总开关（每日签到 / 额度刷新 / 模型刷新 / 账号保活四项）。
+             *
+             * 关闭后 runMaintenanceTick 会跳过这四项业务定时，但唤醒锁与看门狗仍保留
+             * （它们属于服务存活，与业务任务无关，关掉会导致服务被系统回收）。
+             *
+             * 必须在此登记：saveSettings 只写白名单内的键，未登记会被静默丢弃。
+             */
+            "scheduled_tasks_enabled" to "1",
             "aa_api_key" to "",
             "usage_retention_days" to "30",
             // ---- 提示词注入管线（移植自 WorkBuddy 1.2.7）----

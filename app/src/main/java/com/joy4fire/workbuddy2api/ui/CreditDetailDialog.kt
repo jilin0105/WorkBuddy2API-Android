@@ -61,7 +61,10 @@ fun CreditDetailDialog(
 ) {
     var confirmClear by remember { mutableStateOf(false) }
 
-    top.yukonga.miuix.kmp.window.WindowDialog(
+    // 返回手势/返回键关窗：Miuix 的 WindowDialog 不注册返回处理，
+    // AppShell 的 BackHandler 会先消费返回事件，TalkBack 下又点不到空白区。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = true,
         title = "积分详情",
         summary = accountName,

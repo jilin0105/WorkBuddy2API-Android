@@ -458,7 +458,12 @@ private fun AccountMoreDialog(
     var priority by remember(uid) { mutableStateOf(account.optInt("priority").coerceIn(0, 20)) }
     var confirmDelete by remember { mutableStateOf(false) }
 
-    top.yukonga.miuix.kmp.window.WindowDialog(
+    // 返回手势 / 返回键：Miuix 的 WindowDialog 不注册返回处理，
+    // 而 AppShell 的 BackHandler 会先把返回事件消费掉，导致弹窗只能点空白或按钮关闭。
+    // TalkBack 下点不到空白区域，必须有这条路径。
+    // 优先级：删除确认框开着就先关它，否则才关整个弹窗。
+    RegisterDialogBack { if (confirmDelete) confirmDelete = false else onDismiss() }
+    PcDialog(
         show = true,
         title = nickname,
         summary = "${account.optString("region_label", "国内版")} · ${FormatKit.shortUid(uid)}",

@@ -812,10 +812,18 @@ class ApiHostService : Service() {
             // Cached App Freezer 之下，60 秒内必须补上。带超时的锁过期后 isHeld 变 false，这里自动续期。
             acquireWakeLock()
             val settings = NativeCore.settings(this)
-            runAutomaticCheckin(settings)
-            runAutomaticCredits(settings)
-            runAutomaticModels(settings)
-            runAutomaticKeepalive(settings)
+            // 定时任务总开关：关闭后签到/额度刷新/模型刷新/保活全部停摆，
+            // 但唤醒锁与看门狗仍保留（它们属于服务存活，不属于业务定时）。
+            // 默认开启，兼容已有安装。
+            val scheduledOn = settings.optString("scheduled_tasks_enabled", "1") !in setOf("0", "false", "off")
+            if (scheduledOn) {
+                runAutomaticCheckin(settings)
+                runAutomaticCredits(settings)
+                runAutomaticModels(settings)
+                runAutomaticKeepalive(settings)
+            } else {
+                Log.i(TAG, "scheduled tasks disabled by setting")
+            }
             // ⚠️ 数据库清理【不放在这里】。
             //
             // 它内部要做三件重活：删记录（持锁）、扫数据库统计空闲页（持锁）、

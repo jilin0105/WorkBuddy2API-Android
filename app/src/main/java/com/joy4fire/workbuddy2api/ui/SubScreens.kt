@@ -556,6 +556,20 @@ fun ScheduleScreen(context: Context, app: AppState) {
     PcList {
         item {
             PcCard(title = "定时参数") {
+                // 定时任务总开关：它是「要不要自动跑」的总闸，下面四项参数只在开启时有意义，
+                // 因此放在卡片首位。关闭后唤醒锁与看门狗不受影响（那属于服务存活）。
+                val scheduledOn = settings.optString("scheduled_tasks_enabled", "1") !in setOf("0", "false", "off")
+                SwitchPreference(
+                    title = "定时任务",
+                    summary = if (scheduledOn) {
+                        "已开启 · 按下方时段自动签到、刷新额度、保活账号"
+                    } else {
+                        "已关闭 · 不会自动签到、刷新额度或保活账号"
+                    },
+                    checked = scheduledOn,
+                    onCheckedChange = { app.saveSetting("scheduled_tasks_enabled", if (it) "1" else "0") }
+                )
+                PcDivider()
                 SettingRow(
                     label = "每日签到时段",
                     value = settings.optString("checkin_hours", "9,21"),

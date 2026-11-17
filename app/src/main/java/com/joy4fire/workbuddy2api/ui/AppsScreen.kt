@@ -262,7 +262,10 @@ private fun AppDetailDialog(
     onDismiss: () -> Unit
 ) {
     val enabled = item.optBoolean("enabled")
-    top.yukonga.miuix.kmp.window.WindowDialog(
+    // 返回手势/返回键关窗：Miuix 的 WindowDialog 不注册返回处理，
+    // AppShell 的 BackHandler 会先消费返回事件，TalkBack 下又点不到空白区。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = true,
         title = item.optString("name").ifBlank { "API Key" },
         summary = "${item.optString("region_label", "国内版")} · ${if (enabled) "已启用" else "已停用"}",
@@ -337,7 +340,10 @@ private fun AppEditorDialog(
     var customKey by remember(existing) { mutableStateOf("") }
     var error by remember(existing) { mutableStateOf<String?>(null) }
 
-    top.yukonga.miuix.kmp.window.WindowDialog(
+    // 返回手势/返回键关窗：Miuix 的 WindowDialog 不注册返回处理，
+    // AppShell 的 BackHandler 会先消费返回事件，TalkBack 下又点不到空白区。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = true,
         title = if (isEdit) "编辑 API Key" else "创建 API Key",
         onDismissRequest = onDismiss,

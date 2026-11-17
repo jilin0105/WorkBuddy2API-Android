@@ -58,7 +58,9 @@ fun PortSettingRow(
         else -> "服务未运行；修改后启动即使用新端口"
     }
 
-    PcRow(
+    // 同 SettingRow：PcRow 的 onClick 参数从未被真正挂上（函数体里没有任何
+    // clickable 修饰），用它做入口等于点不动。换 PcClickRow（内部是 Card(onClick)）。
+    PcClickRow(
         title = "本地端口",
         summary = hint,
         value = saved.toString(),
@@ -99,7 +101,10 @@ private fun PortEditDialog(
     val valid = parsed != null
     val changed = parsed != initial
 
-    WindowDialog(
+    // 返回手势/返回键关窗：Miuix 的 WindowDialog 不注册返回处理，
+    // AppShell 的 BackHandler 会先消费返回事件，TalkBack 下又点不到空白区。
+    RegisterDialogBack { onDismiss() }
+    PcDialog(
         show = true,
         title = "本地端口",
         onDismissRequest = onDismiss,
